@@ -163,6 +163,7 @@ func TestHandleAddRepoDuplicate(t *testing.T) {
 }
 
 func TestHandleDeleteRepo(t *testing.T) {
+	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfig(t)
 
 	// Add a second repo first so we can delete one.
@@ -173,17 +174,17 @@ func TestHandleDeleteRepo(t *testing.T) {
 	addRR := doJSON(
 		t, srv, http.MethodPost, "/api/v1/repos", addBody,
 	)
-	require.Equal(t, http.StatusCreated, addRR.Code, addRR.Body.String())
+	require.Equal(http.StatusCreated, addRR.Code, addRR.Body.String())
 
 	rr := doJSON(
 		t, srv, http.MethodDelete,
 		"/api/v1/repos/acme/widget", nil,
 	)
-	require.Equal(t, http.StatusNoContent, rr.Code, rr.Body.String())
+	require.Equal(http.StatusNoContent, rr.Code, rr.Body.String())
 
 	cfg2, err := config.Load(cfgPath)
-	require.NoError(t, err)
-	require.Len(t, cfg2.Repos, 1)
+	require.NoError(err)
+	require.Len(cfg2.Repos, 1)
 	Assert.Equal(t, "other-org", cfg2.Repos[0].Owner)
 }
 

@@ -183,6 +183,7 @@ func TestCSRFAppliesUnderBasePath(t *testing.T) {
 }
 
 func TestBasePathDocsAndOpenAPIUsePrefixedURLs(t *testing.T) {
+	assert := Assert.New(t)
 	frontend := fstest.MapFS{
 		"index.html": &fstest.MapFile{
 			Data: []byte(`<!DOCTYPE html><html><head></head><body>app</body></html>`),
@@ -196,12 +197,12 @@ func TestBasePathDocsAndOpenAPIUsePrefixedURLs(t *testing.T) {
 	srv.ServeHTTP(docsRR, docsReq)
 
 	require.Equal(t, http.StatusOK, docsRR.Code, docsRR.Body.String())
-	Assert.Contains(t, docsRR.Body.String(), `apiDescriptionUrl="/middleman/api/v1/openapi.yaml"`)
+	assert.Contains(docsRR.Body.String(), `apiDescriptionUrl="/middleman/api/v1/openapi.yaml"`)
 
 	openAPIReq := httptest.NewRequest(http.MethodGet, "/middleman/api/v1/openapi.json", nil)
 	openAPIRR := httptest.NewRecorder()
 	srv.ServeHTTP(openAPIRR, openAPIReq)
 
 	require.Equal(t, http.StatusOK, openAPIRR.Code, openAPIRR.Body.String())
-	Assert.Contains(t, openAPIRR.Body.String(), `"url":"/middleman/api/v1"`)
+	assert.Contains(openAPIRR.Body.String(), `"url":"/middleman/api/v1"`)
 }

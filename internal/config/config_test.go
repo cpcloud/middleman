@@ -302,6 +302,7 @@ name = "b"
 }
 
 func TestSaveRoundTripEmptyGitHubTokenEnv(t *testing.T) {
+	assert := Assert.New(t)
 	path := writeConfig(t, `
 github_token_env = ""
 
@@ -311,12 +312,12 @@ name = "b"
 `)
 	cfg, err := Load(path)
 	require.NoError(t, err)
-	Assert.Empty(t, cfg.GitHubTokenEnv)
+	assert.Empty(cfg.GitHubTokenEnv)
 
 	savePath := filepath.Join(t.TempDir(), "saved.toml")
 	require.NoError(t, cfg.Save(savePath))
 
 	cfg2, err := Load(savePath)
 	require.NoError(t, err)
-	Assert.Empty(t, cfg2.GitHubTokenEnv)
+	assert.Empty(cfg2.GitHubTokenEnv)
 }

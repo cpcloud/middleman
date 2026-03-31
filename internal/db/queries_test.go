@@ -69,6 +69,7 @@ func TestUpsertAndListRepos(t *testing.T) {
 }
 
 func TestGetRepoByOwnerName(t *testing.T) {
+	assert := Assert.New(t)
 	d := openTestDB(t)
 	ctx := context.Background()
 
@@ -77,11 +78,11 @@ func TestGetRepoByOwnerName(t *testing.T) {
 	r, err := d.GetRepoByOwnerName(ctx, "owner", "repo")
 	require.NoError(t, err)
 	require.NotNil(t, r)
-	Assert.Equal(t, id, r.ID)
+	assert.Equal(id, r.ID)
 
 	missing, err := d.GetRepoByOwnerName(ctx, "no", "such")
 	require.NoError(t, err)
-	Assert.Nil(t, missing)
+	assert.Nil(missing)
 }
 
 func TestUpdateRepoSync(t *testing.T) {
