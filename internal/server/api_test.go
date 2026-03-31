@@ -11,6 +11,7 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v84/github"
+	Assert "github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wesm/middleman/internal/apiclient"
 	"github.com/wesm/middleman/internal/apiclient/generated"
@@ -157,9 +158,7 @@ func setupTestServerWithMock(t *testing.T, mock *mockGH) (*Server, *db.DB) {
 
 	dir := t.TempDir()
 	database, err := db.Open(filepath.Join(dir, "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() { database.Close() })
 
 	syncer := ghclient.NewSyncer(mock, database, nil, time.Minute)
@@ -214,9 +213,7 @@ func seedPR(t *testing.T, database *db.DB, owner, name string, number int) int64
 	ctx := context.Background()
 
 	repoID, err := database.UpsertRepo(ctx, owner, name)
-	if err != nil {
-		t.Fatalf("upsert repo: %v", err)
-	}
+	require.NoError(t, err)
 
 	now := time.Now().UTC().Truncate(time.Second)
 	pr := &db.PullRequest{
@@ -242,13 +239,9 @@ func seedPR(t *testing.T, database *db.DB, owner, name string, number int) int64
 	}
 
 	prID, err := database.UpsertPullRequest(ctx, pr)
-	if err != nil {
-		t.Fatalf("upsert pr: %v", err)
-	}
+	require.NoError(t, err)
 
-	if err := database.EnsureKanbanState(ctx, prID); err != nil {
-		t.Fatalf("ensure kanban state: %v", err)
-	}
+	require.NoError(t, database.EnsureKanbanState(ctx, prID))
 
 	return prID
 }
@@ -401,7 +394,7 @@ func TestAPITriggerSyncIgnoresRequestCancellation(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	t.Fatal("expected sync to complete despite request context cancellation")
+	Assert.Fail(t, "expected sync to complete despite request context cancellation")
 }
 
 func TestAPIReadyForReview(t *testing.T) {
