@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/wesm/middleman/internal/testifyhelpercheck"
+	"github.com/wesm/middleman/tools/testifyhelpercheck"
 	"golang.org/x/tools/go/analysis/singlechecker"
 )
 
