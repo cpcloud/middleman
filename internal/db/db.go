@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	_ "embed"
 	"fmt"
+	"log/slog"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -70,6 +72,49 @@ func (d *DB) migrate() {
 	}
 	for _, m := range migrations {
 		_, _ = d.rw.Exec(m) // Ignore errors — column may already exist
+	}
+	d.migrateReposCollation()
+}
+
+// migrateReposCollation rebuilds the repos table so owner/name use COLLATE
+// NOCASE for case-insensitive uniqueness. Idempotent — skips if already done.
+func (d *DB) migrateReposCollation() {
+	// Check if the owner column already uses NOCASE.
+	var sql string
+	err := d.ro.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='table' AND name='repos'`,
+	).Scan(&sql)
+	if err != nil || strings.Contains(strings.ToUpper(sql), "COLLATE NOCASE") {
+		return
+	}
+
+	// Deduplicate any case-conflicting rows (keep the lowest id).
+	stmts := []string{
+		`DELETE FROM repos WHERE id NOT IN (
+			SELECT MIN(id) FROM repos GROUP BY LOWER(owner), LOWER(name)
+		)`,
+		`CREATE TABLE repos_new (
+			id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+			owner                  TEXT NOT NULL COLLATE NOCASE,
+			name                   TEXT NOT NULL COLLATE NOCASE,
+			last_sync_started_at   DATETIME,
+			last_sync_completed_at DATETIME,
+			last_sync_error        TEXT DEFAULT '',
+			allow_squash_merge     INTEGER NOT NULL DEFAULT 1,
+			allow_merge_commit     INTEGER NOT NULL DEFAULT 1,
+			allow_rebase_merge     INTEGER NOT NULL DEFAULT 1,
+			created_at             DATETIME NOT NULL DEFAULT (datetime('now')),
+			UNIQUE(owner, name)
+		)`,
+		`INSERT INTO repos_new SELECT * FROM repos`,
+		`DROP TABLE repos`,
+		`ALTER TABLE repos_new RENAME TO repos`,
+	}
+	for _, s := range stmts {
+		if _, err := d.rw.Exec(s); err != nil {
+			slog.Warn("repos collation migration failed", "err", err, "stmt", s)
+			return
+		}
 	}
 }
 

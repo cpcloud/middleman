@@ -84,6 +84,7 @@
     // Clear any stale detail selection that no longer matches the filter.
     const page = getPage();
     drawerItem = null;
+    updateDrawerURL(null);
     if (page === "pulls" || page === "pr-detail") {
       navigate("/pulls");
     } else if (page === "issues" || page === "issue-detail") {

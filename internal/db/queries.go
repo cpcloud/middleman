@@ -203,7 +203,7 @@ func (d *DB) GetPullRequest(ctx context.Context, owner, name string, number int)
 		LEFT JOIN kanban_state k ON k.pr_id = p.id
 		LEFT JOIN starred_items s
 		    ON s.item_type = 'pr' AND s.repo_id = p.repo_id AND s.number = p.number
-		WHERE r.owner = ? AND r.name = ? AND p.number = ?`,
+		WHERE r.owner = ? COLLATE NOCASE AND r.name = ? COLLATE NOCASE AND p.number = ?`,
 		owner, name, number,
 	).Scan(
 		&pr.ID, &pr.RepoID, &pr.GitHubID, &pr.Number, &pr.URL, &pr.Title,
@@ -246,7 +246,7 @@ func (d *DB) ListPullRequests(ctx context.Context, opts ListPullsOpts) ([]PullRe
 	}
 
 	if opts.RepoOwner != "" && opts.RepoName != "" {
-		conds = append(conds, "r.owner = ? AND r.name = ?")
+		conds = append(conds, "r.owner = ? COLLATE NOCASE AND r.name = ? COLLATE NOCASE")
 		args = append(args, opts.RepoOwner, opts.RepoName)
 	}
 	if opts.KanbanState != "" {
@@ -577,7 +577,7 @@ func (d *DB) GetDiffSHAs(ctx context.Context, owner, name string, number int) (*
 		       p.state
 		FROM pull_requests p
 		JOIN repos r ON r.id = p.repo_id
-		WHERE r.owner = ? AND r.name = ? AND p.number = ?`,
+		WHERE r.owner = ? COLLATE NOCASE AND r.name = ? COLLATE NOCASE AND p.number = ?`,
 		owner, name, number,
 	).Scan(&s.GitHubHeadSHA, &s.GitHubBaseSHA,
 		&s.DiffHeadSHA, &s.DiffBaseSHA, &s.MergeBaseSHA,
@@ -668,7 +668,7 @@ func (d *DB) GetIssue(
 		JOIN repos r ON r.id = i.repo_id
 		LEFT JOIN starred_items s
 		    ON s.item_type = 'issue' AND s.repo_id = i.repo_id AND s.number = i.number
-		WHERE r.owner = ? AND r.name = ? AND i.number = ?`,
+		WHERE r.owner = ? COLLATE NOCASE AND r.name = ? COLLATE NOCASE AND i.number = ?`,
 		owner, name, number,
 	).Scan(
 		&issue.ID, &issue.RepoID, &issue.GitHubID, &issue.Number,
@@ -708,7 +708,7 @@ func (d *DB) ListIssues(
 	}
 
 	if opts.RepoOwner != "" && opts.RepoName != "" {
-		conds = append(conds, "r.owner = ? AND r.name = ?")
+		conds = append(conds, "r.owner = ? COLLATE NOCASE AND r.name = ? COLLATE NOCASE")
 		args = append(args, opts.RepoOwner, opts.RepoName)
 	}
 	if opts.Starred {

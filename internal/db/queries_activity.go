@@ -26,7 +26,7 @@ func (d *DB) ListActivity(
 
 	if opts.Repo != "" {
 		whereClauses = append(whereClauses,
-			"repo_owner || '/' || repo_name = ?")
+			"repo_owner || '/' || repo_name = ? COLLATE NOCASE")
 		args = append(args, opts.Repo)
 	}
 
