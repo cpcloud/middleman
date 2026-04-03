@@ -113,7 +113,8 @@ func (s *Syncer) Stop() {
 		s.lifecycleMu.Unlock()
 		return
 	}
-	if !s.stopping {
+	initiator := !s.stopping
+	if initiator {
 		s.stopping = true
 		close(s.stopCh)
 	}
@@ -122,10 +123,12 @@ func (s *Syncer) Stop() {
 
 	<-doneCh
 
-	s.lifecycleMu.Lock()
-	s.started = false
-	s.stopping = false
-	s.lifecycleMu.Unlock()
+	if initiator {
+		s.lifecycleMu.Lock()
+		s.started = false
+		s.stopping = false
+		s.lifecycleMu.Unlock()
+	}
 }
 
 // Status returns a snapshot of the current sync state.

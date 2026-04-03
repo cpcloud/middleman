@@ -183,6 +183,33 @@ func TestSyncerStopIsIdempotent(t *testing.T) {
 	syncer.Stop() // must not panic
 }
 
+func TestSyncerStopStartConcurrent(t *testing.T) {
+	database := openTestDB(t)
+	syncer := NewSyncer(
+		&mockClient{}, database, nil,
+		[]RepoRef{{Owner: "o", Name: "r"}},
+		time.Hour,
+	)
+
+	ctx := t.Context()
+	syncer.Start(ctx)
+
+	// Stop and immediately restart — must not panic or leave duplicate pollers.
+	syncer.Stop()
+	syncer.Start(ctx)
+	syncer.Stop()
+
+	// Concurrent Stop calls must not panic.
+	syncer.Start(ctx)
+	done := make(chan struct{})
+	go func() {
+		syncer.Stop()
+		close(done)
+	}()
+	syncer.Stop()
+	<-done
+}
+
 func TestSyncCreatesAndUpdatesPRs(t *testing.T) {
 	assert := Assert.New(t)
 	require := require.New(t)
