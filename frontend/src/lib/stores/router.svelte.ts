@@ -9,6 +9,7 @@ export type Route =
 const rawBase = window.__BASE_PATH__ ?? "/";
 const basePrefix = rawBase === "/" ? "" : rawBase.replace(/\/$/, "");
 const embedded = typeof window !== "undefined" && window.__MIDDLEMAN_EMBEDDED__ === true;
+const settingsAvailable = typeof window !== "undefined" && window.__MIDDLEMAN_SETTINGS__ === true;
 
 export function getBasePath(): string {
   return rawBase;
@@ -46,7 +47,7 @@ function parseRoute(fullPath: string): Route {
     }
     return { page: "pulls", view: "list" };
   }
-  if (path === "/settings" && !embedded) return { page: "settings" };
+  if (path === "/settings" && settingsAvailable && !embedded) return { page: "settings" };
   if (path.startsWith("/issues")) {
     const match = path.slice("/issues".length).match(/^\/([^/]+)\/([^/]+)\/(\d+)$/);
     if (match) {

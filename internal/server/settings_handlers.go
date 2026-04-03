@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/wesm/middleman/internal/config"
 	ghclient "github.com/wesm/middleman/internal/github"
@@ -102,9 +103,9 @@ func (s *Server) handleAddRepo(
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if body.Owner == "" || body.Name == "" {
-		writeError(w, http.StatusBadRequest,
-			"owner and name are required")
+	repo := config.Repo{Owner: body.Owner, Name: body.Name}
+	if err := repo.Normalize(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -112,9 +113,9 @@ func (s *Server) handleAddRepo(
 	defer s.cfgMu.Unlock()
 
 	for _, rp := range s.cfg.Repos {
-		if rp.Owner == body.Owner && rp.Name == body.Name {
+		if strings.EqualFold(rp.Owner, repo.Owner) && strings.EqualFold(rp.Name, repo.Name) {
 			writeError(w, http.StatusBadRequest,
-				body.Owner+"/"+body.Name+" is already configured")
+				repo.Owner+"/"+repo.Name+" is already configured")
 			return
 		}
 	}
@@ -127,8 +128,7 @@ func (s *Server) handleAddRepo(
 		return
 	}
 
-	s.cfg.Repos = append(s.cfg.Repos,
-		config.Repo{Owner: body.Owner, Name: body.Name})
+	s.cfg.Repos = append(s.cfg.Repos, repo)
 
 	if err := s.cfg.Save(s.cfgPath); err != nil {
 		s.cfg.Repos = s.cfg.Repos[:len(s.cfg.Repos)-1]
@@ -146,8 +146,7 @@ func (s *Server) handleAddRepo(
 	s.syncer.SetRepos(refs)
 	go s.syncer.RunOnce(context.WithoutCancel(r.Context()))
 
-	writeJSON(w, http.StatusCreated,
-		config.Repo{Owner: body.Owner, Name: body.Name})
+	writeJSON(w, http.StatusCreated, repo)
 }
 
 func (s *Server) handleDeleteRepo(

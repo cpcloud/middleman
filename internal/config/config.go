@@ -35,10 +35,10 @@ func (r Repo) FullName() string {
 	return r.Owner + "/" + r.Name
 }
 
-// normalize cleans up a Repo entry, extracting owner/name from
+// Normalize cleans up a Repo entry, extracting owner/name from
 // GitHub URLs or SSH addresses if the user pasted one into either
 // field. It also strips a trailing .git suffix.
-func (r *Repo) normalize() error {
+func (r *Repo) Normalize() error {
 	// Check if either field contains a full GitHub URL or SSH
 	// address. If so, extract owner/name from it.
 	for _, raw := range []string{r.Owner, r.Name} {
@@ -303,12 +303,12 @@ func Load(path string) (*Config, error) {
 func (c *Config) Validate() error {
 	seen := make(map[string]int, len(c.Repos))
 	for i := range c.Repos {
-		if err := c.Repos[i].normalize(); err != nil {
+		if err := c.Repos[i].Normalize(); err != nil {
 			return fmt.Errorf("config: repos[%d]: %w", i, err)
 		}
-		key := c.Repos[i].FullName()
+		key := strings.ToLower(c.Repos[i].FullName())
 		if prev, ok := seen[key]; ok {
-			return fmt.Errorf("config: repos[%d]: duplicate of repos[%d] (%s)", i, prev, key)
+			return fmt.Errorf("config: repos[%d]: duplicate of repos[%d] (%s)", i, prev, c.Repos[i].FullName())
 		}
 		seen[key] = i
 	}
