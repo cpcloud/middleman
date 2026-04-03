@@ -46,9 +46,11 @@ async function resolveAndNavigate(
       return;
     }
 
+    const canonicalOwner = data.owner || owner;
+    const canonicalName = data.name || name;
     const path = data.item_type === "pr"
-      ? `/pulls/${owner}/${name}/${number}`
-      : `/issues/${owner}/${name}/${number}`;
+      ? `/pulls/${canonicalOwner}/${canonicalName}/${number}`
+      : `/issues/${canonicalOwner}/${canonicalName}/${number}`;
     navigate(path);
   } catch {
     if (thisRequestId !== requestId) return;

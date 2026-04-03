@@ -970,11 +970,14 @@ func (s *Server) listActivity(ctx context.Context, input *listActivityInput) (*l
 func (s *Server) resolveItem(
 	ctx context.Context, input *repoNumberInput,
 ) (*resolveItemOutput, error) {
-	owner, name, number := input.Owner, input.Name, input.Number
+	owner, name := s.canonicalRepo(input.Owner, input.Name)
+	number := input.Number
 
 	if !s.syncer.IsTrackedRepo(owner, name) {
 		return &resolveItemOutput{
 			Body: resolveItemResponse{
+				Owner:       owner,
+				Name:        name,
 				Number:      number,
 				RepoTracked: false,
 			},
@@ -1000,6 +1003,8 @@ func (s *Server) resolveItem(
 			return &resolveItemOutput{
 				Body: resolveItemResponse{
 					ItemType:    itemType,
+					Owner:       owner,
+					Name:        name,
 					Number:      number,
 					RepoTracked: true,
 				},
@@ -1031,6 +1036,8 @@ func (s *Server) resolveItem(
 	return &resolveItemOutput{
 		Body: resolveItemResponse{
 			ItemType:    itemType,
+			Owner:       owner,
+			Name:        name,
 			Number:      number,
 			RepoTracked: true,
 		},

@@ -358,8 +358,14 @@ type ResolveItemResponse struct {
 	Schema *string `json:"$schema,omitempty"`
 
 	// ItemType 'pr' or 'issue'
-	ItemType    string `json:"item_type"`
-	Number      int64  `json:"number"`
+	ItemType string `json:"item_type"`
+
+	// Name Canonical repo name casing
+	Name   string `json:"name"`
+	Number int64  `json:"number"`
+
+	// Owner Canonical owner casing
+	Owner       string `json:"owner"`
 	RepoTracked bool   `json:"repo_tracked"`
 }
 

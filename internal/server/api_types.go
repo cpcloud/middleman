@@ -41,6 +41,8 @@ type issueDetailResponse struct {
 
 type resolveItemResponse struct {
 	ItemType    string `json:"item_type" doc:"'pr' or 'issue'"`
+	Owner       string `json:"owner" doc:"Canonical owner casing"`
+	Name        string `json:"name" doc:"Canonical repo name casing"`
 	Number      int    `json:"number"`
 	RepoTracked bool   `json:"repo_tracked"`
 }

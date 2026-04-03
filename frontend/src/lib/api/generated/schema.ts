@@ -808,8 +808,12 @@ export interface components {
             readonly $schema?: string;
             /** @description 'pr' or 'issue' */
             item_type: string;
+            /** @description Canonical repo name casing */
+            name: string;
             /** Format: int64 */
             number: number;
+            /** @description Canonical owner casing */
+            owner: string;
             repo_tracked: boolean;
         };
         SetKanbanStateInputBody: {
