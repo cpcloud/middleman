@@ -114,6 +114,13 @@ func (d *DB) migrateReposCollation() {
 			WHERE LOWER(r2.owner) = (SELECT LOWER(r.owner) FROM repos r WHERE r.id = issues.repo_id)
 			  AND LOWER(r2.name) = (SELECT LOWER(r.name) FROM repos r WHERE r.id = issues.repo_id)
 		)`,
+		// Delete starred_items that would conflict after remapping to the
+		// survivor repo_id (keep the one from the survivor).
+		`DELETE FROM starred_items WHERE rowid NOT IN (
+			SELECT MIN(s.rowid) FROM starred_items s
+			JOIN repos r ON r.id = s.repo_id
+			GROUP BY LOWER(r.owner), LOWER(r.name), s.item_type, s.number
+		)`,
 		`UPDATE starred_items SET repo_id = (
 			SELECT MIN(r2.id) FROM repos r2
 			WHERE LOWER(r2.owner) = (SELECT LOWER(r.owner) FROM repos r WHERE r.id = starred_items.repo_id)
