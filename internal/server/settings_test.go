@@ -214,7 +214,7 @@ func TestGetSettingsWithoutPersistence(t *testing.T) {
 	}
 	mock := &mockGH{}
 	syncer := ghclient.NewSyncer(mock, database, nil, nil, time.Minute)
-	srv := New(database, mock, syncer, nil, "/", cfg, ServerOptions{})
+	srv := New(database, mock, syncer, nil, nil, "/", cfg, ServerOptions{})
 
 	// GET /settings should work (read-only).
 	rr := doJSON(t, srv, http.MethodGet, "/api/v1/settings", nil)

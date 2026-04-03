@@ -33,6 +33,7 @@ func setupEmbeddedServer(
 		database,
 		mock,
 		syncer,
+		nil,
 		frontend,
 		basePath,
 		nil,

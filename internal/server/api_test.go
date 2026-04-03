@@ -169,7 +169,7 @@ func setupTestServerWithMock(t *testing.T, mock *mockGH) (*Server, *db.DB) {
 
 	syncer := ghclient.NewSyncer(mock, database, nil, nil, time.Minute)
 	srv := New(
-		database, mock, syncer, nil, "/",
+		database, mock, syncer, nil, nil, "/",
 		nil, ServerOptions{},
 	)
 	return srv, database
@@ -187,7 +187,7 @@ func setupTestServerWithRepos(
 
 	syncer := ghclient.NewSyncer(mock, database, nil, repos, time.Minute)
 	srv := New(
-		database, mock, syncer, nil, "/",
+		database, mock, syncer, nil, nil, "/",
 		nil, ServerOptions{},
 	)
 	return srv, database
@@ -489,7 +489,7 @@ func TestAPITriggerSyncIgnoresRequestCancellation(t *testing.T) {
 		Name:  "widget",
 	}}, time.Minute)
 	srv := New(
-		database, mock, syncer, nil, "/",
+		database, mock, syncer, nil, nil, "/",
 		nil, ServerOptions{},
 	)
 
@@ -549,7 +549,7 @@ func TestAPIReadyForReview(t *testing.T) {
 	}
 	syncer := ghclient.NewSyncer(mock, database, nil, nil, time.Minute)
 	srv := New(
-		database, mock, syncer, nil, "/",
+		database, mock, syncer, nil, nil, "/",
 		nil, ServerOptions{},
 	)
 	client := setupTestClient(t, srv)

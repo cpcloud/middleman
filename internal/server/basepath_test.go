@@ -26,7 +26,7 @@ func setupWithBasePath(t *testing.T, basePath string, frontend fs.FS) *Server {
 	mock := &mockGH{}
 	syncer := ghclient.NewSyncer(mock, database, nil, nil, time.Minute)
 	return New(
-		database, mock, syncer, frontend, basePath,
+		database, mock, syncer, nil, frontend, basePath,
 		nil, ServerOptions{},
 	)
 }

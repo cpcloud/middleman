@@ -301,10 +301,16 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) Validate() error {
+	seen := make(map[string]int, len(c.Repos))
 	for i := range c.Repos {
 		if err := c.Repos[i].normalize(); err != nil {
 			return fmt.Errorf("config: repos[%d]: %w", i, err)
 		}
+		key := c.Repos[i].FullName()
+		if prev, ok := seen[key]; ok {
+			return fmt.Errorf("config: repos[%d]: duplicate of repos[%d] (%s)", i, prev, key)
+		}
+		seen[key] = i
 	}
 
 	if _, err := time.ParseDuration(c.SyncInterval); err != nil {

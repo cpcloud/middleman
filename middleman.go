@@ -6,12 +6,14 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/wesm/middleman/internal/config"
 	"github.com/wesm/middleman/internal/db"
+	"github.com/wesm/middleman/internal/gitclone"
 	ghclient "github.com/wesm/middleman/internal/github"
 	"github.com/wesm/middleman/internal/server"
 	"github.com/wesm/middleman/internal/web"
@@ -101,12 +103,15 @@ func New(opts Options) (*Instance, error) {
 		})
 	}
 
+	cloneDir := filepath.Join(opts.DataDir, "clones")
+	clones := gitclone.New(cloneDir, opts.Token)
+
 	syncer := ghclient.NewSyncer(
-		gh, database, nil, refs, cfg.SyncDuration(),
+		gh, database, clones, refs, cfg.SyncDuration(),
 	)
 
 	srv := server.New(
-		database, gh, syncer, frontend,
+		database, gh, syncer, clones, frontend,
 		cfg.BasePath, cfg,
 		server.ServerOptions{
 			Embedded: opts.Embedded,

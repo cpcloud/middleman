@@ -45,13 +45,14 @@ func New(
 	database *db.DB,
 	gh ghclient.Client,
 	syncer *ghclient.Syncer,
+	clones *gitclone.Manager,
 	frontend fs.FS,
 	basePath string,
 	cfg *config.Config,
 	opts ServerOptions,
 ) *Server {
 	return newServer(
-		database, gh, syncer, nil, frontend,
+		database, gh, syncer, clones, frontend,
 		basePath, cfg, "", opts,
 	)
 }
@@ -169,6 +170,9 @@ func (s *Server) bootstrapScript() string {
 	builder.WriteString(`window.__BASE_PATH__=`)
 	builder.WriteString(string(safeBase))
 	builder.WriteString(`;`)
+	if s.cfgPath != "" {
+		builder.WriteString(`window.__MIDDLEMAN_SETTINGS__=true;`)
+	}
 	if s.options.Embedded {
 		builder.WriteString(`window.__MIDDLEMAN_EMBEDDED__=true;`)
 		if s.options.AppName != "" {

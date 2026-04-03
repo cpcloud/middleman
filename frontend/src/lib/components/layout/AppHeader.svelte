@@ -7,6 +7,7 @@
 
   const THEME_KEY = "middleman-theme";
   const embedded = typeof window !== "undefined" && window.__MIDDLEMAN_EMBEDDED__ === true;
+  const settingsAvailable = typeof window !== "undefined" && window.__MIDDLEMAN_SETTINGS__ === true;
 
   function storedTheme(): string | null {
     try {
@@ -97,7 +98,7 @@
     <button class="action-btn icon-btn" onclick={toggleTheme} title="Toggle theme">
       {dark ? "☀" : "☾"}
     </button>
-    {#if !embedded}
+    {#if settingsAvailable && !embedded}
       <button
         class="action-btn icon-btn"
         class:active={getPage() === "settings"}
