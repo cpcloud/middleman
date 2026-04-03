@@ -664,3 +664,35 @@ func TestSyncItemByNumber_UntrackedRepo(t *testing.T) {
 	require.Error(err)
 	assert.Contains(err.Error(), "not tracked")
 }
+
+func TestSyncPRCanonicalizesCasing(t *testing.T) {
+	assert := Assert.New(t)
+	database := openTestDB(t)
+	ctx := context.Background()
+
+	var gotOwner, gotName string
+	mc := &mockClient{
+		getPullRequestFn: func(_ context.Context, owner, name string, _ int) (*gh.PullRequest, error) {
+			gotOwner = owner
+			gotName = name
+			return buildOpenPR(1, time.Now()), nil
+		},
+	}
+	syncer := NewSyncer(mc, database, nil, []RepoRef{
+		{Owner: "acme", Name: "Widget"},
+	}, time.Minute)
+
+	// Sync with different casing — should resolve to configured canonical form.
+	err := syncer.SyncPR(ctx, "ACME", "widget", 1)
+	require.NoError(t, err)
+
+	assert.Equal("acme", gotOwner, "GitHub client should receive canonical owner")
+	assert.Equal("Widget", gotName, "GitHub client should receive canonical name")
+
+	// Verify only one repo row exists.
+	repos, err := database.ListRepos(ctx)
+	require.NoError(t, err)
+	assert.Len(repos, 1)
+	assert.Equal("acme", repos[0].Owner)
+	assert.Equal("Widget", repos[0].Name)
+}
