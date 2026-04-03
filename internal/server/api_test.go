@@ -997,6 +997,39 @@ func TestResolveItem_Issue(t *testing.T) {
 	require.True(resp.JSON200.RepoTracked)
 }
 
+func TestResolveItem_CanonicalCasing(t *testing.T) {
+	require := require.New(t)
+	repos := []ghclient.RepoRef{{Owner: "Acme", Name: "Widget"}}
+	srv, database := setupTestServerWithRepos(t, &mockGH{}, repos)
+	seedPR(t, database, "Acme", "Widget", 10)
+	seedIssue(t, database, "Acme", "Widget", 20, "open")
+	client := setupTestClient(t, srv)
+
+	// PR with mixed-case input
+	resp, err := client.HTTP.PostReposByOwnerByNameItemsByNumberResolveWithResponse(
+		context.Background(), "acme", "widget", 10,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.Equal("pr", resp.JSON200.ItemType)
+	require.Equal("Acme", resp.JSON200.Owner)
+	require.Equal("Widget", resp.JSON200.Name)
+	require.True(resp.JSON200.RepoTracked)
+
+	// Issue with mixed-case input
+	resp, err = client.HTTP.PostReposByOwnerByNameItemsByNumberResolveWithResponse(
+		context.Background(), "ACME", "WIDGET", 20,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.Equal("issue", resp.JSON200.ItemType)
+	require.Equal("Acme", resp.JSON200.Owner)
+	require.Equal("Widget", resp.JSON200.Name)
+	require.True(resp.JSON200.RepoTracked)
+}
+
 func TestResolveItem_UntrackedRepo(t *testing.T) {
 	require := require.New(t)
 	srv, _ := setupTestServer(t)

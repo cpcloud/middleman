@@ -79,6 +79,7 @@ func (s *Syncer) Start(ctx context.Context) {
 	}
 	s.stopCh = make(chan struct{})
 	s.started = true
+	stopCh := s.stopCh // capture for the goroutine
 	s.lifecycleMu.Unlock()
 
 	s.wg.Go(func() {
@@ -89,7 +90,7 @@ func (s *Syncer) Start(ctx context.Context) {
 			select {
 			case <-ticker.C:
 				s.RunOnce(ctx)
-			case <-s.stopCh:
+			case <-stopCh:
 				return
 			case <-ctx.Done():
 				return
@@ -107,10 +108,13 @@ func (s *Syncer) Stop() {
 		return
 	}
 	close(s.stopCh)
-	s.started = false
 	s.lifecycleMu.Unlock()
 
 	s.wg.Wait()
+
+	s.lifecycleMu.Lock()
+	s.started = false
+	s.lifecycleMu.Unlock()
 }
 
 // Status returns a snapshot of the current sync state.
