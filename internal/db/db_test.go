@@ -172,6 +172,68 @@ func TestMigrateReposCollation_InterruptedRename(t *testing.T) {
 	require.Equal("Acme", owner)
 }
 
+func TestMigrateReposCollation_CoexistenceRecovery(t *testing.T) {
+	require := require.New(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	// Simulate: prior startup created empty repos (with NOCASE) but repos_new
+	// has the real data from a failed migration.
+	raw, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
+	require.NoError(err)
+	_, err = raw.Exec(`CREATE TABLE repos (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		owner TEXT NOT NULL COLLATE NOCASE,
+		name TEXT NOT NULL COLLATE NOCASE,
+		last_sync_started_at DATETIME,
+		last_sync_completed_at DATETIME,
+		last_sync_error TEXT DEFAULT '',
+		allow_squash_merge INTEGER NOT NULL DEFAULT 1,
+		allow_merge_commit INTEGER NOT NULL DEFAULT 1,
+		allow_rebase_merge INTEGER NOT NULL DEFAULT 1,
+		created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+		UNIQUE(owner, name)
+	)`)
+	require.NoError(err)
+	_, err = raw.Exec(`CREATE TABLE repos_new (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		owner TEXT NOT NULL COLLATE NOCASE,
+		name TEXT NOT NULL COLLATE NOCASE,
+		last_sync_started_at DATETIME,
+		last_sync_completed_at DATETIME,
+		last_sync_error TEXT DEFAULT '',
+		allow_squash_merge INTEGER NOT NULL DEFAULT 1,
+		allow_merge_commit INTEGER NOT NULL DEFAULT 1,
+		allow_rebase_merge INTEGER NOT NULL DEFAULT 1,
+		created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+		UNIQUE(owner, name)
+	)`)
+	require.NoError(err)
+	_, err = raw.Exec(`INSERT INTO repos_new (owner, name) VALUES ('Acme', 'Widget')`)
+	require.NoError(err)
+	raw.Close()
+
+	// Reopen — recovery should replace empty repos with populated repos_new.
+	d, err := Open(path)
+	require.NoError(err)
+	defer d.Close()
+
+	var count int
+	require.NoError(d.ro.QueryRow(`SELECT COUNT(*) FROM repos`).Scan(&count))
+	require.Equal(1, count)
+
+	var owner string
+	require.NoError(d.ro.QueryRow(`SELECT owner FROM repos`).Scan(&owner))
+	require.Equal("Acme", owner)
+
+	// repos_new should be gone.
+	var leftover bool
+	_ = d.ro.QueryRow(
+		`SELECT 1 FROM sqlite_master WHERE type='table' AND name='repos_new'`,
+	).Scan(&leftover)
+	require.False(leftover)
+}
+
 func TestMigrateMergeableState(t *testing.T) {
 	d := openTestDB(t)
 	var val string

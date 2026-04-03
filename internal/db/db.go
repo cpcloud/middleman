@@ -56,24 +56,51 @@ func (d *DB) init() error {
 	return nil
 }
 
-// recoverReposRename completes an interrupted collation migration that
-// crashed between DROP TABLE repos and ALTER TABLE repos_new RENAME TO repos.
-// Must run before schemaSQL (which would create an empty repos table).
+// recoverReposRename completes an interrupted collation migration.
+// Handles two failure states:
+//  1. repos missing, repos_new present: crash between DROP and RENAME.
+//  2. repos exists (empty), repos_new present: a prior startup ran
+//     schemaSQL which recreated an empty repos before recovery could run.
+//
+// Must run before schemaSQL to handle case 1 on first occurrence.
 func (d *DB) recoverReposRename() {
-	var reposExists bool
-	_ = d.rw.QueryRow(
-		`SELECT 1 FROM sqlite_master WHERE type='table' AND name='repos'`,
-	).Scan(&reposExists)
-	if reposExists {
-		return
-	}
 	var newExists bool
 	_ = d.rw.QueryRow(
 		`SELECT 1 FROM sqlite_master WHERE type='table' AND name='repos_new'`,
 	).Scan(&newExists)
-	if newExists {
+	if !newExists {
+		return
+	}
+
+	var reposExists bool
+	_ = d.rw.QueryRow(
+		`SELECT 1 FROM sqlite_master WHERE type='table' AND name='repos'`,
+	).Scan(&reposExists)
+
+	if !reposExists {
+		// Case 1: repos was dropped, repos_new has the data.
 		if _, err := d.rw.Exec(`ALTER TABLE repos_new RENAME TO repos`); err != nil {
 			slog.Warn("repos collation migration: recover rename", "err", err)
+		}
+		return
+	}
+
+	// Case 2: both exist. repos_new has the real data; repos is empty
+	// (recreated by a prior schemaSQL run). Replace repos with repos_new.
+	if _, err := d.rw.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		slog.Warn("repos collation recovery: cannot disable FKs", "err", err)
+		return
+	}
+	defer d.rw.Exec(`PRAGMA foreign_keys = ON`) //nolint:errcheck
+
+	stmts := []string{
+		`DROP TABLE repos`,
+		`ALTER TABLE repos_new RENAME TO repos`,
+	}
+	for _, s := range stmts {
+		if _, err := d.rw.Exec(s); err != nil {
+			slog.Warn("repos collation recovery: coexistence fix", "err", err, "stmt", s)
+			return
 		}
 	}
 }
