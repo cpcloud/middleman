@@ -80,6 +80,15 @@
     void loadPulls(getView() === "board" ? { state: "open" } : undefined);
     void loadIssues();
     void loadActivity();
+
+    // Clear any stale detail selection that no longer matches the filter.
+    const page = getPage();
+    drawerItem = null;
+    if (page === "pulls" || page === "pr-detail") {
+      navigate("/pulls");
+    } else if (page === "issues" || page === "issue-detail") {
+      navigate("/issues");
+    }
   });
 
   // Sync route state: restore drawer, select items, clear stale state.

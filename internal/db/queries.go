@@ -12,9 +12,12 @@ import (
 // --- Repos ---
 
 // UpsertRepo inserts a repo if it does not exist, then returns its ID.
+// Lookups and conflict detection are case-insensitive. If the canonical
+// casing has changed the existing row is updated.
 func (d *DB) UpsertRepo(ctx context.Context, owner, name string) (int64, error) {
 	_, err := d.rw.ExecContext(ctx,
-		`INSERT INTO repos (owner, name) VALUES (?, ?) ON CONFLICT(owner, name) DO NOTHING`,
+		`INSERT INTO repos (owner, name) VALUES (?, ?)
+		 ON CONFLICT(owner, name) DO UPDATE SET owner = excluded.owner, name = excluded.name`,
 		owner, name,
 	)
 	if err != nil {
@@ -22,7 +25,7 @@ func (d *DB) UpsertRepo(ctx context.Context, owner, name string) (int64, error) 
 	}
 	var id int64
 	err = d.ro.QueryRowContext(ctx,
-		`SELECT id FROM repos WHERE owner = ? AND name = ?`, owner, name,
+		`SELECT id FROM repos WHERE owner = ? COLLATE NOCASE AND name = ? COLLATE NOCASE`, owner, name,
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("get repo id after upsert: %w", err)
@@ -90,7 +93,7 @@ func (d *DB) GetRepoByOwnerName(ctx context.Context, owner, name string) (*Repo,
 		`SELECT id, owner, name, last_sync_started_at, last_sync_completed_at,
 		        last_sync_error, allow_squash_merge, allow_merge_commit,
 		        allow_rebase_merge, created_at
-		 FROM repos WHERE owner = ? AND name = ?`, owner, name,
+		 FROM repos WHERE owner = ? COLLATE NOCASE AND name = ? COLLATE NOCASE`, owner, name,
 	).Scan(
 		&r.ID, &r.Owner, &r.Name,
 		&r.LastSyncStartedAt, &r.LastSyncCompletedAt,
@@ -424,7 +427,7 @@ func (d *DB) GetPRIDByRepoAndNumber(ctx context.Context, owner, name string, num
 	err := d.ro.QueryRowContext(ctx, `
 		SELECT p.id FROM pull_requests p
 		JOIN repos r ON r.id = p.repo_id
-		WHERE r.owner = ? AND r.name = ? AND p.number = ?`,
+		WHERE r.owner = ? COLLATE NOCASE AND r.name = ? COLLATE NOCASE AND p.number = ?`,
 		owner, name, number,
 	).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -765,7 +768,7 @@ func (d *DB) GetIssueIDByRepoAndNumber(
 	err := d.ro.QueryRowContext(ctx, `
 		SELECT i.id FROM issues i
 		JOIN repos r ON r.id = i.repo_id
-		WHERE r.owner = ? AND r.name = ? AND i.number = ?`,
+		WHERE r.owner = ? COLLATE NOCASE AND r.name = ? COLLATE NOCASE AND i.number = ?`,
 		owner, name, number,
 	).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {

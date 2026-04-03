@@ -1,7 +1,7 @@
 CREATE TABLE IF NOT EXISTS repos (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner                 TEXT NOT NULL,
-    name                  TEXT NOT NULL,
+    owner                 TEXT NOT NULL COLLATE NOCASE,
+    name                  TEXT NOT NULL COLLATE NOCASE,
     last_sync_started_at  DATETIME,
     last_sync_completed_at DATETIME,
     last_sync_error       TEXT DEFAULT '',
