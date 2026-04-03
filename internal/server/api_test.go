@@ -1115,3 +1115,86 @@ func TestOpenAPIDocumentsCustomStatusCodes(t *testing.T) {
 	require.Contains(spec, `"operationId":"post-issue-comment"`)
 	require.Contains(spec, `"responses":{"201":{"content":{"application/json":{"schema":{"$ref":"#/components/schemas/IssueEvent"}}},"description":"Created"}`)
 }
+
+func TestSyncPRHandlerCanonicalizesRepoCase(t *testing.T) {
+	assert := Assert.New(t)
+
+	num := 1
+	state := "open"
+	title := "test"
+	htmlURL := "https://github.com/acme/Widget/pull/1"
+	id := int64(1000)
+	now := time.Now()
+	sha := "abc123"
+	headRef := "feat"
+	baseRef := "main"
+	mock := &mockGH{
+		getPullRequestFn: func(_ context.Context, _, _ string, _ int) (*gh.PullRequest, error) {
+			return &gh.PullRequest{
+				ID: &id, Number: &num, Title: &title, HTMLURL: &htmlURL,
+				State: &state, UpdatedAt: &gh.Timestamp{Time: now}, CreatedAt: &gh.Timestamp{Time: now},
+				Head: &gh.PullRequestBranch{Ref: &headRef, SHA: &sha},
+				Base: &gh.PullRequestBranch{Ref: &baseRef},
+			}, nil
+		},
+	}
+	srv, database := setupTestServerWithRepos(t, mock, []ghclient.RepoRef{
+		{Owner: "acme", Name: "Widget"},
+	})
+
+	_, err := database.UpsertRepo(context.Background(), "acme", "Widget")
+	require.NoError(t, err)
+
+	// Sync with differently cased owner/name.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/repos/ACME/widget/pulls/1/sync", nil)
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+
+	assert.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	assert.Contains(rr.Body.String(), `"repo_owner":"acme"`)
+	assert.Contains(rr.Body.String(), `"repo_name":"Widget"`)
+
+	// Verify no duplicate repo row was created.
+	repos, err := database.ListRepos(context.Background())
+	require.NoError(t, err)
+	assert.Len(repos, 1)
+}
+
+func TestSyncIssueHandlerCanonicalizesRepoCase(t *testing.T) {
+	assert := Assert.New(t)
+
+	num := 42
+	state := "open"
+	title := "test issue"
+	htmlURL := "https://github.com/acme/Widget/issues/42"
+	id := int64(42000)
+	now := time.Now()
+	mock := &mockGH{
+		getIssueFn: func(_ context.Context, _, _ string, _ int) (*gh.Issue, error) {
+			return &gh.Issue{
+				ID: &id, Number: &num, Title: &title, HTMLURL: &htmlURL,
+				State: &state, UpdatedAt: &gh.Timestamp{Time: now}, CreatedAt: &gh.Timestamp{Time: now},
+			}, nil
+		},
+	}
+	srv, database := setupTestServerWithRepos(t, mock, []ghclient.RepoRef{
+		{Owner: "acme", Name: "Widget"},
+	})
+
+	_, err := database.UpsertRepo(context.Background(), "acme", "Widget")
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/repos/ACME/widget/issues/42/sync", nil)
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+
+	assert.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	assert.Contains(rr.Body.String(), `"repo_owner":"acme"`)
+	assert.Contains(rr.Body.String(), `"repo_name":"Widget"`)
+
+	repos, err := database.ListRepos(context.Background())
+	require.NoError(t, err)
+	assert.Len(repos, 1)
+}
