@@ -135,7 +135,9 @@ func (d *DB) migrateReposCollation() {
 	}
 
 	// Delete duplicate repos (keep the lowest id per case-folded name).
+	// Drop leftover temp table from any prior failed migration attempt.
 	stmts := []string{
+		`DROP TABLE IF EXISTS repos_new`,
 		`DELETE FROM repos WHERE id NOT IN (
 			SELECT MIN(id) FROM repos GROUP BY LOWER(owner), LOWER(name)
 		)`,
