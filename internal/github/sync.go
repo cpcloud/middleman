@@ -40,7 +40,9 @@ type Syncer struct {
 	running      atomic.Bool
 	status       atomic.Value // stores *SyncStatus
 	stopCh       chan struct{}
+	doneCh       chan struct{} // closed when the goroutine has fully exited
 	started      bool
+	stopping     bool
 	lifecycleMu  sync.Mutex
 	wg           sync.WaitGroup
 	displayNames map[string]string // login -> display name, per sync run
@@ -73,16 +75,19 @@ func (s *Syncer) SetRepos(repos []RepoRef) {
 // Safe to call after Stop — a new polling goroutine will be started.
 func (s *Syncer) Start(ctx context.Context) {
 	s.lifecycleMu.Lock()
-	if s.started {
+	if s.started || s.stopping {
 		s.lifecycleMu.Unlock()
 		return
 	}
 	s.stopCh = make(chan struct{})
+	s.doneCh = make(chan struct{})
 	s.started = true
 	stopCh := s.stopCh // capture for the goroutine
+	doneCh := s.doneCh
 	s.lifecycleMu.Unlock()
 
 	s.wg.Go(func() {
+		defer close(doneCh)
 		s.RunOnce(ctx)
 		ticker := time.NewTicker(s.interval)
 		defer ticker.Stop()
@@ -100,20 +105,26 @@ func (s *Syncer) Start(ctx context.Context) {
 }
 
 // Stop signals the background goroutine to exit and waits for it to finish.
-// Safe to call multiple times. After Stop returns, Start may be called again.
+// Safe to call concurrently and multiple times. After Stop returns, Start
+// may be called again.
 func (s *Syncer) Stop() {
 	s.lifecycleMu.Lock()
 	if !s.started {
 		s.lifecycleMu.Unlock()
 		return
 	}
-	close(s.stopCh)
+	if !s.stopping {
+		s.stopping = true
+		close(s.stopCh)
+	}
+	doneCh := s.doneCh
 	s.lifecycleMu.Unlock()
 
-	s.wg.Wait()
+	<-doneCh
 
 	s.lifecycleMu.Lock()
 	s.started = false
+	s.stopping = false
 	s.lifecycleMu.Unlock()
 }
 
