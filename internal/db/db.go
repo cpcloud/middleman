@@ -85,8 +85,17 @@ func (d *DB) recoverReposRename() {
 		return
 	}
 
-	// Case 2: both exist. repos_new has the real data; repos is empty
-	// (recreated by a prior schemaSQL run). Replace repos with repos_new.
+	// Case 2: both exist. Only replace repos if it's empty (the synthetic
+	// table from a prior schemaSQL run). If repos has been repopulated,
+	// just drop repos_new — the normal migration will handle it.
+	var reposCount int
+	_ = d.rw.QueryRow(`SELECT COUNT(*) FROM repos`).Scan(&reposCount)
+	if reposCount > 0 {
+		// repos was repopulated after the broken startup; drop the stale copy.
+		d.rw.Exec(`DROP TABLE repos_new`) //nolint:errcheck
+		return
+	}
+
 	if _, err := d.rw.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
 		slog.Warn("repos collation recovery: cannot disable FKs", "err", err)
 		return
