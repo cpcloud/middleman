@@ -24,6 +24,7 @@ import (
 type mockGH struct {
 	getPullRequestFn     func(context.Context, string, string, int) (*gh.PullRequest, error)
 	getIssueFn           func(context.Context, string, string, int) (*gh.Issue, error)
+	getRepositoryFn      func(context.Context, string, string) (*gh.Repository, error)
 	markReadyForReviewFn func(context.Context, string, string, int) (*gh.PullRequest, error)
 	editPullRequestFn    func(context.Context, string, string, int, string) (*gh.PullRequest, error)
 	editIssueFn          func(context.Context, string, string, int, string) (*gh.Issue, error)
@@ -97,8 +98,11 @@ func (m *mockGH) CreateIssueComment(
 }
 
 func (m *mockGH) GetRepository(
-	_ context.Context, _, _ string,
+	ctx context.Context, owner, repo string,
 ) (*gh.Repository, error) {
+	if m.getRepositoryFn != nil {
+		return m.getRepositoryFn(ctx, owner, repo)
+	}
 	return &gh.Repository{}, nil
 }
 

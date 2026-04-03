@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	gh "github.com/google/go-github/v84/github"
 	Assert "github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wesm/middleman/internal/config"
@@ -164,28 +166,68 @@ func TestHandleAddRepoDuplicate(t *testing.T) {
 }
 
 func TestHandleAddRepoNormalizesURL(t *testing.T) {
-	srv, _, cfgPath := setupTestServerWithConfig(t)
-
-	body := map[string]string{
-		"owner": "https://github.com/other-org/other-repo.git",
-		"name":  "",
+	tests := []struct {
+		name  string
+		owner string
+		rname string
+	}{
+		{"https URL", "https://github.com/other-org/other-repo.git", ""},
+		{"SSH address", "git@github.com:other-org/other-repo.git", ""},
 	}
-	rr := doJSON(
-		t, srv, http.MethodPost, "/api/v1/repos", body,
-	)
-	assert := Assert.New(t)
-	assert.Equal(http.StatusCreated, rr.Code, rr.Body.String())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := Assert.New(t)
 
-	var created config.Repo
-	require.NoError(t, json.NewDecoder(rr.Body).Decode(&created))
-	assert.Equal("other-org", created.Owner)
-	assert.Equal("other-repo", created.Name)
+			dir := t.TempDir()
+			database, err := db.Open(filepath.Join(dir, "test.db"))
+			require.NoError(t, err)
+			t.Cleanup(func() { database.Close() })
 
-	cfg2, err := config.Load(cfgPath)
-	require.NoError(t, err)
-	assert.Len(cfg2.Repos, 2)
-	assert.Equal("other-org", cfg2.Repos[1].Owner)
-	assert.Equal("other-repo", cfg2.Repos[1].Name)
+			cfgContent := `
+sync_interval = "5m"
+github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8090
+
+[[repos]]
+owner = "acme"
+name = "widget"
+`
+			cfgPath := filepath.Join(dir, "config.toml")
+			require.NoError(t, os.WriteFile(cfgPath, []byte(cfgContent), 0o644))
+			cfg, err := config.Load(cfgPath)
+			require.NoError(t, err)
+
+			var gotOwner, gotName string
+			mock := &mockGH{
+				getRepositoryFn: func(_ context.Context, owner, name string) (*gh.Repository, error) {
+					gotOwner = owner
+					gotName = name
+					return &gh.Repository{}, nil
+				},
+			}
+			syncer := ghclient.NewSyncer(mock, database, nil, nil, time.Minute)
+			srv := NewWithConfig(database, mock, syncer, nil, nil, cfg, cfgPath, ServerOptions{})
+
+			body := map[string]string{"owner": tt.owner, "name": tt.rname}
+			rr := doJSON(t, srv, http.MethodPost, "/api/v1/repos", body)
+			assert.Equal(http.StatusCreated, rr.Code, rr.Body.String())
+
+			assert.Equal("other-org", gotOwner, "GetRepository should receive normalized owner")
+			assert.Equal("other-repo", gotName, "GetRepository should receive normalized name")
+
+			var created config.Repo
+			require.NoError(t, json.NewDecoder(rr.Body).Decode(&created))
+			assert.Equal("other-org", created.Owner)
+			assert.Equal("other-repo", created.Name)
+
+			cfg2, err := config.Load(cfgPath)
+			require.NoError(t, err)
+			assert.Len(cfg2.Repos, 2)
+			assert.Equal("other-org", cfg2.Repos[1].Owner)
+			assert.Equal("other-repo", cfg2.Repos[1].Name)
+		})
+	}
 }
 
 func TestHandleAddRepoCaseInsensitiveDuplicate(t *testing.T) {
