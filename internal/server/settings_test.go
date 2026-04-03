@@ -163,6 +163,44 @@ func TestHandleAddRepoDuplicate(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
 }
 
+func TestHandleAddRepoNormalizesURL(t *testing.T) {
+	srv, _, cfgPath := setupTestServerWithConfig(t)
+
+	body := map[string]string{
+		"owner": "https://github.com/other-org/other-repo.git",
+		"name":  "",
+	}
+	rr := doJSON(
+		t, srv, http.MethodPost, "/api/v1/repos", body,
+	)
+	assert := Assert.New(t)
+	assert.Equal(http.StatusCreated, rr.Code, rr.Body.String())
+
+	var created config.Repo
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&created))
+	assert.Equal("other-org", created.Owner)
+	assert.Equal("other-repo", created.Name)
+
+	cfg2, err := config.Load(cfgPath)
+	require.NoError(t, err)
+	assert.Len(cfg2.Repos, 2)
+	assert.Equal("other-org", cfg2.Repos[1].Owner)
+	assert.Equal("other-repo", cfg2.Repos[1].Name)
+}
+
+func TestHandleAddRepoCaseInsensitiveDuplicate(t *testing.T) {
+	srv, _, _ := setupTestServerWithConfig(t)
+
+	body := map[string]string{
+		"owner": "ACME",
+		"name":  "Widget",
+	}
+	rr := doJSON(
+		t, srv, http.MethodPost, "/api/v1/repos", body,
+	)
+	Assert.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+}
+
 func TestHandleDeleteRepo(t *testing.T) {
 	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfig(t)
