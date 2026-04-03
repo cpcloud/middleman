@@ -79,6 +79,24 @@ func (d *DB) migrate() {
 // migrateReposCollation rebuilds the repos table so owner/name use COLLATE
 // NOCASE for case-insensitive uniqueness. Idempotent — skips if already done.
 func (d *DB) migrateReposCollation() {
+	// Recover from a prior crash between DROP TABLE repos and RENAME repos_new.
+	var reposExists bool
+	_ = d.ro.QueryRow(
+		`SELECT 1 FROM sqlite_master WHERE type='table' AND name='repos'`,
+	).Scan(&reposExists)
+	if !reposExists {
+		var newExists bool
+		_ = d.ro.QueryRow(
+			`SELECT 1 FROM sqlite_master WHERE type='table' AND name='repos_new'`,
+		).Scan(&newExists)
+		if newExists {
+			if _, err := d.rw.Exec(`ALTER TABLE repos_new RENAME TO repos`); err != nil {
+				slog.Warn("repos collation migration: recover rename", "err", err)
+			}
+		}
+		return
+	}
+
 	// Check if the owner column already uses NOCASE.
 	var tableDDL string
 	err := d.ro.QueryRow(
