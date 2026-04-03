@@ -66,6 +66,18 @@ func (s *Server) filterConfiguredRepos(repos []db.Repo) []db.Repo {
 	return filtered
 }
 
+// canonicalRepo resolves the canonical owner/name casing from the
+// syncer's configured repo list. Falls back to the input values if
+// the repo is not tracked (e.g. tests with no syncer config).
+func (s *Server) canonicalRepo(owner, name string) (string, string) {
+	if s.syncer != nil {
+		if ref, ok := s.syncer.ResolveTrackedRepo(owner, name); ok {
+			return ref.Owner, ref.Name
+		}
+	}
+	return owner, name
+}
+
 // lookupRepoID resolves a repository from owner/name inputs and returns a
 // stable not-found error for handlers that need repo identity only.
 func (s *Server) lookupRepoID(ctx context.Context, owner, name string) (int64, error) {

@@ -812,14 +812,16 @@ func (s *Server) syncStatus(_ context.Context, _ *struct{}) (*syncStatusOutput, 
 }
 
 func (s *Server) syncPR(ctx context.Context, input *repoNumberInput) (*syncPROutput, error) {
-	if err := s.syncer.SyncPR(ctx, input.Owner, input.Name, input.Number); err != nil {
+	owner, name := s.canonicalRepo(input.Owner, input.Name)
+
+	if err := s.syncer.SyncPR(ctx, owner, name, input.Number); err != nil {
 		if strings.Contains(err.Error(), "is not tracked") {
 			return nil, huma.Error403Forbidden(err.Error())
 		}
 		return nil, huma.Error502BadGateway("sync PR: " + err.Error())
 	}
 
-	pr, err := s.db.GetPullRequest(ctx, input.Owner, input.Name, input.Number)
+	pr, err := s.db.GetPullRequest(ctx, owner, name, input.Number)
 	if err != nil {
 		return nil, huma.Error500InternalServerError("get pull request: " + err.Error())
 	}
@@ -838,20 +840,22 @@ func (s *Server) syncPR(ctx context.Context, input *repoNumberInput) (*syncPROut
 	return &syncPROutput{Body: pullDetailResponse{
 		PullRequest: pr,
 		Events:      events,
-		RepoOwner:   input.Owner,
-		RepoName:    input.Name,
+		RepoOwner:   owner,
+		RepoName:    name,
 	}}, nil
 }
 
 func (s *Server) syncIssue(ctx context.Context, input *repoNumberInput) (*syncIssueOutput, error) {
-	if err := s.syncer.SyncIssue(ctx, input.Owner, input.Name, input.Number); err != nil {
+	owner, name := s.canonicalRepo(input.Owner, input.Name)
+
+	if err := s.syncer.SyncIssue(ctx, owner, name, input.Number); err != nil {
 		if strings.Contains(err.Error(), "is not tracked") {
 			return nil, huma.Error403Forbidden(err.Error())
 		}
 		return nil, huma.Error502BadGateway("sync issue: " + err.Error())
 	}
 
-	issue, err := s.db.GetIssue(ctx, input.Owner, input.Name, input.Number)
+	issue, err := s.db.GetIssue(ctx, owner, name, input.Number)
 	if err != nil {
 		return nil, huma.Error500InternalServerError("get issue: " + err.Error())
 	}
@@ -914,13 +918,13 @@ func (s *Server) listActivity(ctx context.Context, input *listActivityInput) (*l
 		s.cfgMu.Lock()
 		configured := make(map[string]bool, len(s.cfg.Repos))
 		for _, cr := range s.cfg.Repos {
-			configured[cr.Owner+"/"+cr.Name] = true
+			configured[strings.ToLower(cr.Owner+"/"+cr.Name)] = true
 		}
 		s.cfgMu.Unlock()
 
 		filtered := items[:0]
 		for _, it := range items {
-			if configured[it.RepoOwner+"/"+it.RepoName] {
+			if configured[strings.ToLower(it.RepoOwner+"/"+it.RepoName)] {
 				filtered = append(filtered, it)
 			}
 		}
@@ -1060,7 +1064,9 @@ func (s *Server) getDiff(ctx context.Context, input *getDiffInput) (*getDiffOutp
 		return nil, huma.Error503ServiceUnavailable("diff view not available: clone manager not configured")
 	}
 
-	shas, err := s.db.GetDiffSHAs(ctx, input.Owner, input.Name, input.Number)
+	owner, name := s.canonicalRepo(input.Owner, input.Name)
+
+	shas, err := s.db.GetDiffSHAs(ctx, owner, name, input.Number)
 	if err != nil {
 		return nil, huma.Error500InternalServerError("failed to look up PR")
 	}
@@ -1072,7 +1078,7 @@ func (s *Server) getDiff(ctx context.Context, input *getDiffInput) (*getDiffOutp
 	}
 
 	hideWhitespace := input.Whitespace == "hide"
-	result, err := s.clones.Diff(ctx, input.Owner, input.Name, shas.MergeBaseSHA, shas.DiffHeadSHA, hideWhitespace)
+	result, err := s.clones.Diff(ctx, owner, name, shas.MergeBaseSHA, shas.DiffHeadSHA, hideWhitespace)
 	if err != nil {
 		if errors.Is(err, gitclone.ErrNotFound) {
 			return nil, huma.Error404NotFound("diff not available: referenced commit not found")
