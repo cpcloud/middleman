@@ -130,6 +130,48 @@ func TestMigrateReposCollation(t *testing.T) {
 	require.Contains(ddl, "COLLATE NOCASE")
 }
 
+func TestMigrateReposCollation_InterruptedRename(t *testing.T) {
+	require := require.New(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	// Simulate a crash between DROP TABLE repos and RENAME repos_new.
+	raw, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
+	require.NoError(err)
+
+	// Create repos_new (the post-migration table) with data, but no repos table.
+	_, err = raw.Exec(`CREATE TABLE repos_new (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		owner TEXT NOT NULL COLLATE NOCASE,
+		name TEXT NOT NULL COLLATE NOCASE,
+		last_sync_started_at DATETIME,
+		last_sync_completed_at DATETIME,
+		last_sync_error TEXT DEFAULT '',
+		allow_squash_merge INTEGER NOT NULL DEFAULT 1,
+		allow_merge_commit INTEGER NOT NULL DEFAULT 1,
+		allow_rebase_merge INTEGER NOT NULL DEFAULT 1,
+		created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+		UNIQUE(owner, name)
+	)`)
+	require.NoError(err)
+	_, err = raw.Exec(`INSERT INTO repos_new (owner, name) VALUES ('Acme', 'Widget')`)
+	require.NoError(err)
+	raw.Close()
+
+	// Reopen through Open — recovery should rename repos_new to repos.
+	d, err := Open(path)
+	require.NoError(err)
+	defer d.Close()
+
+	var count int
+	require.NoError(d.ro.QueryRow(`SELECT COUNT(*) FROM repos`).Scan(&count))
+	require.Equal(1, count)
+
+	var owner string
+	require.NoError(d.ro.QueryRow(`SELECT owner FROM repos WHERE id = 1`).Scan(&owner))
+	require.Equal("Acme", owner)
+}
+
 func TestMigrateMergeableState(t *testing.T) {
 	d := openTestDB(t)
 	var val string
