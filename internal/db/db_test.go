@@ -52,6 +52,84 @@ func TestOpenIdempotent(t *testing.T) {
 	d2.Close()
 }
 
+func TestMigrateReposCollation(t *testing.T) {
+	require := require.New(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	// Create a database with the real schema but patch repos to use the OLD
+	// collation (no COLLATE NOCASE) so the migration triggers on reopen.
+	raw, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(0)")
+	require.NoError(err)
+
+	// Apply the current schema, then rebuild repos without NOCASE.
+	_, err = raw.Exec(schemaSQL)
+	require.NoError(err)
+	for _, s := range []string{
+		`CREATE TABLE repos_old (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			owner TEXT NOT NULL,
+			name TEXT NOT NULL,
+			last_sync_started_at DATETIME,
+			last_sync_completed_at DATETIME,
+			last_sync_error TEXT DEFAULT '',
+			allow_squash_merge INTEGER NOT NULL DEFAULT 1,
+			allow_merge_commit INTEGER NOT NULL DEFAULT 1,
+			allow_rebase_merge INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			UNIQUE(owner, name)
+		)`,
+		`INSERT INTO repos_old SELECT * FROM repos`,
+		`DROP TABLE repos`,
+		`ALTER TABLE repos_old RENAME TO repos`,
+	} {
+		_, err = raw.Exec(s)
+		require.NoError(err)
+	}
+
+	// Insert case-conflicting repos (old schema allows this).
+	_, err = raw.Exec(`INSERT INTO repos (id, owner, name) VALUES (1, 'Acme', 'Widget'), (2, 'acme', 'widget')`)
+	require.NoError(err)
+
+	// Add child rows: PR on repo 1, issue on repo 2, stars on both (conflicting).
+	_, err = raw.Exec(`INSERT INTO pull_requests (repo_id, github_id, number, created_at, updated_at, last_activity_at)
+		VALUES (1, 100, 1, datetime('now'), datetime('now'), datetime('now'))`)
+	require.NoError(err)
+	_, err = raw.Exec(`INSERT INTO issues (repo_id, github_id, number, created_at, updated_at, last_activity_at)
+		VALUES (2, 200, 5, datetime('now'), datetime('now'), datetime('now'))`)
+	require.NoError(err)
+	_, err = raw.Exec(`INSERT INTO starred_items (item_type, repo_id, number) VALUES ('pr', 1, 1), ('pr', 2, 1)`)
+	require.NoError(err)
+	raw.Close()
+
+	// Reopen through our normal Open path — this triggers the migration.
+	d, err := Open(path)
+	require.NoError(err)
+	defer d.Close()
+
+	// Verify: only one repo remains with the survivor's casing.
+	var count int
+	require.NoError(d.ro.QueryRow(`SELECT COUNT(*) FROM repos`).Scan(&count))
+	require.Equal(1, count)
+
+	// All child rows point to the surviving repo.
+	var prRepoID, issueRepoID int64
+	require.NoError(d.ro.QueryRow(`SELECT repo_id FROM pull_requests WHERE github_id = 100`).Scan(&prRepoID))
+	require.NoError(d.ro.QueryRow(`SELECT repo_id FROM issues WHERE github_id = 200`).Scan(&issueRepoID))
+	require.Equal(prRepoID, issueRepoID)
+
+	// Only one star survives (the duplicate was deduplicated).
+	require.NoError(d.ro.QueryRow(`SELECT COUNT(*) FROM starred_items`).Scan(&count))
+	require.Equal(1, count)
+
+	// The table now uses COLLATE NOCASE.
+	var ddl string
+	require.NoError(d.ro.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='table' AND name='repos'`,
+	).Scan(&ddl))
+	require.Contains(ddl, "COLLATE NOCASE")
+}
+
 func TestMigrateMergeableState(t *testing.T) {
 	d := openTestDB(t)
 	var val string
