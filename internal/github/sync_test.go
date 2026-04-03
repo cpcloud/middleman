@@ -670,6 +670,10 @@ func TestSyncPRCanonicalizesCasing(t *testing.T) {
 	database := openTestDB(t)
 	ctx := context.Background()
 
+	// Pre-seed the canonical repo row so we can verify it's reused.
+	canonicalID, err := database.UpsertRepo(ctx, "acme", "Widget")
+	require.NoError(t, err)
+
 	var gotOwner, gotName string
 	mc := &mockClient{
 		getPullRequestFn: func(_ context.Context, owner, name string, _ int) (*gh.PullRequest, error) {
@@ -683,16 +687,98 @@ func TestSyncPRCanonicalizesCasing(t *testing.T) {
 	}, time.Minute)
 
 	// Sync with different casing — should resolve to configured canonical form.
-	err := syncer.SyncPR(ctx, "ACME", "widget", 1)
+	err = syncer.SyncPR(ctx, "ACME", "widget", 1)
 	require.NoError(t, err)
 
 	assert.Equal("acme", gotOwner, "GitHub client should receive canonical owner")
 	assert.Equal("Widget", gotName, "GitHub client should receive canonical name")
 
-	// Verify only one repo row exists.
+	// Verify the existing repo row was reused, not duplicated.
 	repos, err := database.ListRepos(ctx)
 	require.NoError(t, err)
 	assert.Len(repos, 1)
-	assert.Equal("acme", repos[0].Owner)
-	assert.Equal("Widget", repos[0].Name)
+	assert.Equal(canonicalID, repos[0].ID)
+}
+
+func TestSyncIssueCanonicalizesCasing(t *testing.T) {
+	assert := Assert.New(t)
+	database := openTestDB(t)
+	ctx := context.Background()
+
+	canonicalID, err := database.UpsertRepo(ctx, "acme", "Widget")
+	require.NoError(t, err)
+
+	var gotOwner, gotName string
+	num := 42
+	state := "open"
+	title := "test issue"
+	url := "https://github.com/acme/Widget/issues/42"
+	id := int64(42000)
+	now := time.Now()
+	mc := &mockClient{
+		getIssueFn: func(_ context.Context, owner, name string, _ int) (*gh.Issue, error) {
+			gotOwner = owner
+			gotName = name
+			return &gh.Issue{
+				ID: &id, Number: &num, Title: &title, HTMLURL: &url,
+				State: &state, UpdatedAt: makeTimestamp(now), CreatedAt: makeTimestamp(now),
+			}, nil
+		},
+	}
+	syncer := NewSyncer(mc, database, nil, []RepoRef{
+		{Owner: "acme", Name: "Widget"},
+	}, time.Minute)
+
+	err = syncer.SyncIssue(ctx, "ACME", "widget", 42)
+	require.NoError(t, err)
+
+	assert.Equal("acme", gotOwner)
+	assert.Equal("Widget", gotName)
+
+	repos, err := database.ListRepos(ctx)
+	require.NoError(t, err)
+	assert.Len(repos, 1)
+	assert.Equal(canonicalID, repos[0].ID)
+}
+
+func TestSyncItemByNumberCanonicalizesCasing(t *testing.T) {
+	assert := Assert.New(t)
+	database := openTestDB(t)
+	ctx := context.Background()
+
+	canonicalID, err := database.UpsertRepo(ctx, "acme", "Widget")
+	require.NoError(t, err)
+
+	var gotIssueOwner, gotIssueName string
+	num := 7
+	state := "open"
+	title := "test issue"
+	url := "https://github.com/acme/Widget/issues/7"
+	id := int64(7000)
+	now := time.Now()
+	mc := &mockClient{
+		getIssueFn: func(_ context.Context, owner, name string, _ int) (*gh.Issue, error) {
+			gotIssueOwner = owner
+			gotIssueName = name
+			return &gh.Issue{
+				ID: &id, Number: &num, Title: &title, HTMLURL: &url,
+				State: &state, UpdatedAt: makeTimestamp(now), CreatedAt: makeTimestamp(now),
+			}, nil
+		},
+	}
+	syncer := NewSyncer(mc, database, nil, []RepoRef{
+		{Owner: "acme", Name: "Widget"},
+	}, time.Minute)
+
+	itemType, err := syncer.SyncItemByNumber(ctx, "ACME", "widget", 7)
+	require.NoError(t, err)
+	assert.Equal("issue", itemType)
+
+	assert.Equal("acme", gotIssueOwner)
+	assert.Equal("Widget", gotIssueName)
+
+	repos, err := database.ListRepos(ctx)
+	require.NoError(t, err)
+	assert.Len(repos, 1)
+	assert.Equal(canonicalID, repos[0].ID)
 }
