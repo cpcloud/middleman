@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -641,7 +642,7 @@ func (s *Syncer) IsTrackedRepo(owner, name string) bool {
 	repos := s.repos
 	s.reposMu.Unlock()
 	for _, r := range repos {
-		if r.Owner == owner && r.Name == name {
+		if strings.EqualFold(r.Owner, owner) && strings.EqualFold(r.Name, name) {
 			return true
 		}
 	}

@@ -166,7 +166,7 @@ func (s *Server) handleDeleteRepo(
 
 	idx := -1
 	for i, rp := range s.cfg.Repos {
-		if rp.Owner == owner && rp.Name == name {
+		if strings.EqualFold(rp.Owner, owner) && strings.EqualFold(rp.Name, name) {
 			idx = i
 			break
 		}

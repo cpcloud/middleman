@@ -1,6 +1,7 @@
 import { apiErrorMessage, client } from "../api/runtime.js";
 import type { Issue, IssueDetail, IssuesParams } from "../api/types.js";
 import { getGlobalRepo } from "./filter.svelte.js";
+import { getPage } from "./router.svelte.js";
 
 let issues = $state<Issue[]>([]);
 let loading = $state(false);
@@ -134,6 +135,14 @@ async function syncIssueDetail(owner: string, name: string, number: number, gen:
   } finally {
     if (gen === issueSyncGeneration) detailSyncing = false;
   }
+  if (gen === issueSyncGeneration) await refreshIssuesIfActive();
+}
+
+function refreshIssuesIfActive(): Promise<void> {
+  if (getPage() === "issues") {
+    return loadIssues();
+  }
+  return Promise.resolve();
 }
 
 async function refreshIssueDetail(owner: string, name: string, number: number): Promise<void> {

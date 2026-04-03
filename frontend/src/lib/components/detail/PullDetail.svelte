@@ -160,8 +160,9 @@
   }
 
   function reviewColor(decision: string): string {
-    if (decision === "APPROVED") return "chip--green";
-    if (decision === "CHANGES_REQUESTED") return "chip--red";
+    const d = decision.toLowerCase();
+    if (d === "approved") return "chip--green";
+    if (d === "changes_requested") return "chip--red";
     return "chip--muted";
   }
 

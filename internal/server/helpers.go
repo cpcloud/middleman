@@ -53,13 +53,13 @@ func (s *Server) filterConfiguredRepos(repos []db.Repo) []db.Repo {
 	s.cfgMu.Lock()
 	configured := make(map[string]bool, len(s.cfg.Repos))
 	for _, cr := range s.cfg.Repos {
-		configured[cr.Owner+"/"+cr.Name] = true
+		configured[strings.ToLower(cr.Owner+"/"+cr.Name)] = true
 	}
 	s.cfgMu.Unlock()
 
 	filtered := make([]db.Repo, 0, len(repos))
 	for _, r := range repos {
-		if configured[r.Owner+"/"+r.Name] {
+		if configured[strings.ToLower(r.Owner+"/"+r.Name)] {
 			filtered = append(filtered, r)
 		}
 	}
