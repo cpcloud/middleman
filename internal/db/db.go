@@ -80,15 +80,54 @@ func (d *DB) migrate() {
 // NOCASE for case-insensitive uniqueness. Idempotent — skips if already done.
 func (d *DB) migrateReposCollation() {
 	// Check if the owner column already uses NOCASE.
-	var sql string
+	var tableDDL string
 	err := d.ro.QueryRow(
 		`SELECT sql FROM sqlite_master WHERE type='table' AND name='repos'`,
-	).Scan(&sql)
-	if err != nil || strings.Contains(strings.ToUpper(sql), "COLLATE NOCASE") {
+	).Scan(&tableDDL)
+	if err != nil || strings.Contains(strings.ToUpper(tableDDL), "COLLATE NOCASE") {
 		return
 	}
 
-	// Deduplicate any case-conflicting rows (keep the lowest id).
+	// Disable FK checks for the table rebuild, re-enable after.
+	if _, err := d.rw.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		slog.Warn("repos collation migration: cannot disable FKs", "err", err)
+		return
+	}
+	defer d.rw.Exec(`PRAGMA foreign_keys = ON`) //nolint:errcheck
+
+	tx, err := d.rw.Begin()
+	if err != nil {
+		slog.Warn("repos collation migration: begin tx", "err", err)
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Remap child rows from duplicate repos to the survivor (lowest id).
+	childTables := []string{
+		`UPDATE pull_requests SET repo_id = (
+			SELECT MIN(r2.id) FROM repos r2
+			WHERE LOWER(r2.owner) = (SELECT LOWER(r.owner) FROM repos r WHERE r.id = pull_requests.repo_id)
+			  AND LOWER(r2.name) = (SELECT LOWER(r.name) FROM repos r WHERE r.id = pull_requests.repo_id)
+		)`,
+		`UPDATE issues SET repo_id = (
+			SELECT MIN(r2.id) FROM repos r2
+			WHERE LOWER(r2.owner) = (SELECT LOWER(r.owner) FROM repos r WHERE r.id = issues.repo_id)
+			  AND LOWER(r2.name) = (SELECT LOWER(r.name) FROM repos r WHERE r.id = issues.repo_id)
+		)`,
+		`UPDATE starred_items SET repo_id = (
+			SELECT MIN(r2.id) FROM repos r2
+			WHERE LOWER(r2.owner) = (SELECT LOWER(r.owner) FROM repos r WHERE r.id = starred_items.repo_id)
+			  AND LOWER(r2.name) = (SELECT LOWER(r.name) FROM repos r WHERE r.id = starred_items.repo_id)
+		)`,
+	}
+	for _, s := range childTables {
+		if _, err := tx.Exec(s); err != nil {
+			slog.Warn("repos collation migration: remap children", "err", err)
+			return
+		}
+	}
+
+	// Delete duplicate repos (keep the lowest id per case-folded name).
 	stmts := []string{
 		`DELETE FROM repos WHERE id NOT IN (
 			SELECT MIN(id) FROM repos GROUP BY LOWER(owner), LOWER(name)
@@ -111,10 +150,14 @@ func (d *DB) migrateReposCollation() {
 		`ALTER TABLE repos_new RENAME TO repos`,
 	}
 	for _, s := range stmts {
-		if _, err := d.rw.Exec(s); err != nil {
+		if _, err := tx.Exec(s); err != nil {
 			slog.Warn("repos collation migration failed", "err", err, "stmt", s)
 			return
 		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		slog.Warn("repos collation migration: commit", "err", err)
 	}
 }
 
