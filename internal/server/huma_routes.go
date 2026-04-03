@@ -874,14 +874,21 @@ func (s *Server) syncIssue(ctx context.Context, input *repoNumberInput) (*syncIs
 	return &syncIssueOutput{Body: issueDetailResponse{
 		Issue:     issue,
 		Events:    events,
-		RepoOwner: input.Owner,
-		RepoName:  input.Name,
+		RepoOwner: owner,
+		RepoName:  name,
 	}}, nil
 }
 
 func (s *Server) listActivity(ctx context.Context, input *listActivityInput) (*listActivityOutput, error) {
+	repo := input.Repo
+	if repo != "" {
+		if parts := strings.SplitN(repo, "/", 2); len(parts) == 2 {
+			o, n := s.canonicalRepo(parts[0], parts[1])
+			repo = o + "/" + n
+		}
+	}
 	opts := db.ListActivityOpts{
-		Repo:   input.Repo,
+		Repo:   repo,
 		Types:  input.Types,
 		Search: input.Search,
 	}
