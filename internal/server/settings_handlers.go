@@ -121,7 +121,7 @@ func (s *Server) handleAddRepo(
 	}
 
 	if _, err := s.gh.GetRepository(
-		r.Context(), body.Owner, body.Name,
+		r.Context(), repo.Owner, repo.Name,
 	); err != nil {
 		writeError(w, http.StatusBadGateway,
 			"GitHub API error: "+err.Error())
