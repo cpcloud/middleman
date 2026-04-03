@@ -638,26 +638,33 @@ func (s *Syncer) fetchAndUpdateClosedIssue(
 
 // IsTrackedRepo checks whether the given repo is in the configured list.
 func (s *Syncer) IsTrackedRepo(owner, name string) bool {
+	_, ok := s.resolveTrackedRepo(owner, name)
+	return ok
+}
+
+// resolveTrackedRepo returns the canonical RepoRef for a tracked repo,
+// using case-insensitive matching. Returns false if not found.
+func (s *Syncer) resolveTrackedRepo(owner, name string) (RepoRef, bool) {
 	s.reposMu.Lock()
 	repos := s.repos
 	s.reposMu.Unlock()
 	for _, r := range repos {
 		if strings.EqualFold(r.Owner, owner) && strings.EqualFold(r.Name, name) {
-			return true
+			return r, true
 		}
 	}
-	return false
+	return RepoRef{}, false
 }
 
 // SyncPR fetches fresh data for a single PR from GitHub and updates the DB.
 // Unlike the periodic sync, this always does a full fetch (details, timeline, CI).
 // Returns an error if the repo is not in the configured repo list.
 func (s *Syncer) SyncPR(ctx context.Context, owner, name string, number int) error {
-	if !s.IsTrackedRepo(owner, name) {
+	repo, ok := s.resolveTrackedRepo(owner, name)
+	if !ok {
 		return fmt.Errorf("repo %s/%s is not tracked", owner, name)
 	}
-
-	repo := RepoRef{Owner: owner, Name: name}
+	owner, name = repo.Owner, repo.Name
 
 	repoID, err := s.db.UpsertRepo(ctx, owner, name)
 	if err != nil {
@@ -724,11 +731,11 @@ func (s *Syncer) SyncPR(ctx context.Context, owner, name string, number int) err
 // SyncIssue fetches fresh data for a single issue from GitHub and updates the DB.
 // Returns an error if the repo is not in the configured repo list.
 func (s *Syncer) SyncIssue(ctx context.Context, owner, name string, number int) error {
-	if !s.IsTrackedRepo(owner, name) {
+	repo, ok := s.resolveTrackedRepo(owner, name)
+	if !ok {
 		return fmt.Errorf("repo %s/%s is not tracked", owner, name)
 	}
-
-	repo := RepoRef{Owner: owner, Name: name}
+	owner, name = repo.Owner, repo.Name
 
 	repoID, err := s.db.UpsertRepo(ctx, owner, name)
 	if err != nil {
@@ -756,9 +763,11 @@ func (s *Syncer) SyncIssue(ctx context.Context, owner, name string, number int) 
 func (s *Syncer) SyncItemByNumber(
 	ctx context.Context, owner, name string, number int,
 ) (string, error) {
-	if !s.IsTrackedRepo(owner, name) {
+	repo, ok := s.resolveTrackedRepo(owner, name)
+	if !ok {
 		return "", fmt.Errorf("repo %s/%s is not tracked", owner, name)
 	}
+	owner, name = repo.Owner, repo.Name
 
 	// GitHub's Issues API returns both issues and PRs. If the
 	// response has PullRequestLinks, it's a PR.
