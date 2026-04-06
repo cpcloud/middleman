@@ -82,14 +82,21 @@ type Syncer struct {
 }
 ```
 
-Set during server construction via a setter: `syncer.SetOnStatusChange(func(status *SyncStatus) { hub.Broadcast(...) })`. No import cycle -- the github package doesn't import server.
+Set during server construction via a setter. No import cycle -- the github package doesn't import server.
+
+```go
+syncer.SetOnStatusChange(func(status *SyncStatus) {
+    hub.Broadcast(Event{Type: "sync_status", Data: status})
+    if !status.Running {
+        hub.Broadcast(Event{Type: "data_changed", Data: struct{}{}})
+    }
+})
+```
 
 The callback fires at each `s.status.Store(...)` call site in `RunOnce`:
-1. `SyncStatus{Running: true}` -- sync started
-2. `SyncStatus{Running: true, CurrentRepo: ..., Progress: ...}` -- per-repo progress (fires once per repo)
-3. `SyncStatus{Running: false, LastRunAt: ..., LastError: ...}` -- sync complete
-
-After the final status store (sync complete), also broadcast `Event{Type: "data_changed", Data: struct{}{}}`.
+1. `SyncStatus{Running: true}` -- sync started (broadcasts `sync_status`)
+2. `SyncStatus{Running: true, CurrentRepo: ..., Progress: ...}` -- per-repo progress (broadcasts `sync_status`)
+3. `SyncStatus{Running: false, LastRunAt: ..., LastError: ...}` -- sync complete (broadcasts `sync_status` + `data_changed`)
 
 ### WriteTimeout
 
@@ -173,25 +180,36 @@ type Syncer struct {
 }
 ```
 
-Populated during normal sync (when `ListOpenPullRequests` returns 200). Each PR's head SHA is stored after processing. Lost on process restart, but so is the ETag cache, so the first sync always does a full fetch.
+Populated during normal sync (when `ListOpenPullRequests` returns 200). On each 200 response, replace the entire inner map for this repoID with only the PRs from the current response -- this automatically evicts entries for closed/merged PRs that no longer appear in the open list. Lost on process restart, but so is the ETag cache, so the first sync always does a full fetch.
 
 #### Four call sites with IsNotModified handling
 
 **1. `doSyncRepo` -- ListOpenPullRequests:**
+
+The 304 path must NOT return early -- `doSyncRepo` still needs to run `syncIssues` after PR handling. Structure:
+
 ```go
 ghPRs, err := s.client.ListOpenPullRequests(ctx, repo.Owner, repo.Name)
 if IsNotModified(err) {
     // PR list unchanged -- still refresh CI status for existing open PRs
-    return s.refreshCIForExistingPRs(ctx, repo, repoID)
-}
-if err != nil {
+    if ciErr := s.refreshCIForExistingPRs(ctx, repo, repoID); ciErr != nil {
+        slog.Error("refresh CI for existing PRs", "repo", repoName, "err", ciErr)
+    }
+    // Fall through to syncIssues below
+} else if err != nil {
     return fmt.Errorf("list open PRs: %w", err)
+} else {
+    // Normal path: process PRs, handle closures, populate headSHAs cache
+    // ... existing PR processing logic ...
 }
+
+// Always sync issues regardless of PR list ETag result
+if err := s.syncIssues(ctx, repo, repoID); err != nil { ... }
 ```
 
-New helper `refreshCIForExistingPRs`: reads the head SHA cache for this repoID, calls `refreshCIStatus` for each entry. If the cache is empty (first sync after restart), falls through to the error path which triggers a full fetch on the next cycle (the 304 won't happen anyway since there's no cached ETag).
+New helper `refreshCIForExistingPRs`: reads the head SHA cache for this repoID, calls `refreshCIStatus` for each entry. If the cache is empty (first sync after restart), returns nil (the 304 won't happen anyway since there's no cached ETag on first sync).
 
-On normal 200 response, store each PR's head SHA in the cache after processing.
+On normal 200 response, replace the headSHAs entry for this repoID with only the current open PRs' head SHAs.
 
 **2. `syncIssues` -- ListOpenIssues:**
 ```go
@@ -237,7 +255,26 @@ if combined == nil && checkRuns == nil {
 }
 ```
 
-When one is nil (304) and the other has data (200), the DB update uses the new data for the changed source and preserves existing data for the unchanged source. Read the existing values from DB before the partial update.
+**Partial update when one source is 304:**
+
+When one source returns 304 and the other returns 200, we need a partial DB update. The normalization functions (`NormalizeCIStatus`, `NormalizeCIChecks`) require their respective non-nil inputs, so we cannot normalize 304 sources.
+
+Approach: read the existing `ci_status` and `ci_checks_json` from the DB row. For the 200 source, normalize and use the new value. For the 304 source, keep the existing DB value. Write the merged result back.
+
+```go
+existingStatus, existingChecks := s.db.GetPRCIFields(ctx, repoID, number)
+ciStatus := existingStatus
+ciChecksJSON := existingChecks
+if combined != nil {
+    ciStatus = NormalizeCIStatus(combined)
+}
+if checkRuns != nil {
+    ciChecksJSON = NormalizeCIChecks(checkRuns, combined)
+}
+return s.db.UpdatePRCIStatus(ctx, repoID, number, ciStatus, ciChecksJSON)
+```
+
+Note: `NormalizeCIChecks(checkRuns, combined)` uses `combined` for commit status entries. When combined is nil (304), call `NormalizeCIChecks(checkRuns, nil)` — the function should handle nil combined by omitting commit status entries (they haven't changed and are already stored in the DB from a prior sync). This requires a small adjustment to `NormalizeCIChecks` to treat nil combined as "no commit statuses to add."
 
 ### Pagination and ETags
 
@@ -330,6 +367,8 @@ App unmount    -> disconnect() (close EventSource)
 
 `connect()` is called from `App.svelte`'s `onMount`. `disconnect()` is called from `onDestroy`.
 
+**No event replay:** The SSE endpoint does not use event IDs or maintain a replay buffer. Events emitted during a brief SSE disconnection are lost. This is acceptable because: (a) polling re-enables immediately on disconnect and catches up within seconds, and (b) the next `data_changed` event after reconnection triggers a full refresh of all active views.
+
 ### Fallback Behavior
 
 When SSE is disconnected (fallback):
@@ -392,7 +431,9 @@ When SSE is connected:
 |------|--------|
 | `internal/server/server.go` | Add `EventHub` field, register `GET /api/v1/events` handler, set `WriteTimeout: 0`, wire syncer callback via `SetOnStatusChange` |
 | `internal/github/client.go` | Wrap OAuth2 transport with `etagTransport` in `NewClient` |
-| `internal/github/sync.go` | Add `onStatusChange` callback + setter, `headSHAs` cache, `IsNotModified` checks at 4 call sites, `refreshCIForExistingPRs` helper |
+| `internal/github/sync.go` | Add `onStatusChange` callback + setter, `headSHAs` cache, `IsNotModified` checks at 4 call sites, `refreshCIForExistingPRs` helper, refactor `refreshCIStatus` to take `number int, headSHA string` instead of `*gh.PullRequest` |
+| `internal/github/normalize.go` | Handle nil `combined` parameter in `NormalizeCIChecks` (skip commit status entries when nil) |
+| `internal/db/queries.go` | Add `GetPRCIFields(ctx, repoID, number)` query for partial CI update reads |
 | `frontend/src/lib/stores/sync.svelte.ts` | Add `updateSyncFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
 | `frontend/src/lib/stores/activity.svelte.ts` | Add `refreshFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
 | `frontend/src/lib/stores/detail.svelte.ts` | Add `refreshFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
