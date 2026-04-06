@@ -132,23 +132,31 @@ type etagTransport struct {
 }
 
 type etagEntry struct {
-    etag string
+    etag     string
+    cachedAt time.Time
 }
+```
+
+**ETag TTL:** Cached ETags expire after `etagTTL` (constant, 30 minutes). Expired entries are treated as uncached — no `If-None-Match` sent, forcing an unconditional fetch. This bounds staleness for edge cases where a 304 hides changes that only affect later pages (see "Pagination and ETags" section). At the default 5-minute sync interval, this means ~6 ETag-accelerated cycles per unconditional refresh — still a large rate limit improvement over no caching.
+
+```go
+const etagTTL = 30 * time.Minute
 ```
 
 `RoundTrip(req)`:
 1. Check if this is a paginated later-page request: if the URL has a `page` query parameter with value > 1, skip ETag handling entirely — pass through to the base transport and return.
-2. Look up `req.URL.String()` in cache. If found, clone the request and add `If-None-Match: <etag>` header (must clone to avoid mutating the original).
+2. Look up `req.URL.String()` in cache. If found AND not expired (`time.Since(entry.cachedAt) < etagTTL`), clone the request and add `If-None-Match: <etag>` header (must clone to avoid mutating the original). If expired, delete the entry and proceed as uncached.
 3. Call `base.RoundTrip(req)` with the (possibly modified) request.
-4. On 200: if the response has an `ETag` header AND does NOT have a `Link` header containing `rel="next"` (indicating this is a single-page result), store the ETag in cache. If the response IS multi-page (has `Link: next`), do NOT cache the ETag — this ensures multi-page endpoints always fetch fresh on the next cycle.
+4. On 200: if the response has an `ETag` header AND does NOT have a `Link` header containing `rel="next"` (indicating this is a single-page result), store the ETag in cache with `cachedAt: time.Now()`. If the response IS multi-page (has `Link: next`), delete any previously-cached ETag for this URL (`cache.Delete(url)`) — this evicts stale entries from when the endpoint was single-page and ensures multi-page endpoints always fetch fresh on the next cycle.
 5. On 304: return response as-is (empty body, 304 status).
 6. On other status: return response as-is.
 
-**Why two pagination guards:**
+**Three pagination safeguards:**
 - Step 1 (page parameter check) prevents later pages from caching or using stale ETags. go-github's first page request has no `page` parameter, while subsequent pages have `page=2`, `page=3`, etc.
-- Step 4 (Link: next check) prevents the first page of multi-page results from being cached. Without this, a repo with >100 PRs would cache page 1's ETag, and subsequent 304s would skip the entire list — missing changes to PRs on later pages indefinitely.
+- Step 4 (Link: next eviction) prevents the first page of multi-page results from being cached, AND actively evicts any previously-cached ETag for that URL. This handles the single-page → multi-page transition: if a repo was single-page (ETag cached), then grows past 100 items, the first 200 response with `Link: next` evicts the stale entry.
+- Step 2 (TTL expiry) bounds staleness for the reverse edge case: a cached single-page ETag that 304s indefinitely, hiding a transition to multi-page. `ListOpenPullRequests` uses GitHub's default `created desc` sort, so page 1 content can remain unchanged even when later-page items are modified. The 30-minute TTL forces periodic unconditional fetches, bounding the window during which such changes are invisible.
 
-Both guards are self-contained in the transport. No syncer, client, or collectPages changes are needed for multi-page handling.
+All three are self-contained in the transport. No syncer, client, or collectPages changes are needed.
 
 ### Not-Modified Detection
 
@@ -237,13 +245,15 @@ Issues have no independent background updates (unlike CI), so 304 means skip ent
 
 **Later pages bypass ETags:** URLs with a `page` query parameter > 1 skip ETag handling entirely (no `If-None-Match` sent, no ETag stored). go-github's first-page request has no `page` parameter; subsequent pages have `page=2`, `page=3`, etc. This prevents a correctness bug: if page 1 returns 200 (data changed) but page 2 had a stale cached ETag and returned 304, `collectPages` would abort with a not-modified error, discarding the real page-1 changes.
 
-**Multi-page first pages are not cached:** The transport checks the `Link` response header for `rel="next"`. If present, the response spans multiple pages, and the transport does NOT cache the ETag. This prevents indefinite staleness: a cached ETag on page 1 would cause 304s that skip the entire list, missing changes to items on later pages.
+**Multi-page first pages evict cached ETags:** The transport checks the `Link` response header for `rel="next"`. If present, the response spans multiple pages — the transport does NOT cache the ETag and explicitly deletes any previously-cached entry for that URL. This handles the single-page → multi-page transition: a repo that was under 100 items (ETag cached) then grows past 100 won't retain a stale ETag.
 
-When the first page returns 304, `collectPages` returns the not-modified error immediately. The caller treats the entire list as unchanged and skips processing. Single-page repos (the common case) get full ETag benefit. Multi-page repos always fetch fresh.
+**TTL bounds hidden transitions:** A cached single-page ETag can legitimately 304 even after the list grows to multiple pages, because `ListOpenPullRequests` uses GitHub's `created desc` sort — page 1 content may not change when items shift to later pages. The 30-minute TTL on cached ETags forces periodic unconditional fetches, bounding the window during which such changes are invisible. At the default 5-minute sync interval, this means ~6 ETag-accelerated cycles per unconditional refresh.
+
+When the first page returns 304, `collectPages` returns the not-modified error immediately. The caller treats the entire list as unchanged and skips processing. Single-page repos (the common case) get full ETag benefit. Multi-page repos always fetch fresh after the first unconditional cycle detects the transition.
 
 ### ETag Cache Lifetime
 
-The `sync.Map` lives on the transport for the process lifetime. Entries are keyed by full URL (including query params). Only first-page URLs are cached (later pages are excluded), so cache size is bounded by repos * 2 list endpoints. For a typical setup (5 repos), this is 10 entries. No eviction needed.
+The `sync.Map` lives on the transport for the process lifetime. Entries are keyed by full URL (including query params). Only single-page first-page URLs are cached (later pages and multi-page first pages are excluded), so cache size is bounded by repos * 2 list endpoints. For a typical setup (5 repos), this is at most 10 entries. Entries expire after `etagTTL` (30 minutes) and are lazily deleted on lookup. No background eviction needed.
 
 ---
 
@@ -362,6 +372,9 @@ When SSE is connected:
 - Different URLs get independent ETag entries
 - Request without cached ETag has no `If-None-Match` header
 - Requests with `page` query parameter > 1 bypass ETag handling (no `If-None-Match` sent, no ETag stored)
+- 200 response with `Link: rel="next"` evicts any previously-cached ETag for that URL
+- Single-page → multi-page → single-page transition: ETag cached on single-page, evicted on multi-page detection, re-cached when back to single-page
+- Expired ETag entries (older than `etagTTL`) are treated as uncached
 - `IsNotModified` returns true for 304 errors, false for other errors
 
 **Integration tests:**
