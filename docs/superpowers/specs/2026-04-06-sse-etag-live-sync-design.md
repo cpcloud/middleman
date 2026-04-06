@@ -292,7 +292,7 @@ The events store imports `getPage()` from the router store to determine which vi
 | `pulls` | list | `loadPulls()` to refresh sidebar/list. If a PR detail is selected (`getSelectedPR()` is non-null), also call `refreshDetail()` with that PR's owner/name/number. |
 | `pulls` | board | `loadPulls({ state: "open" })` (board always shows open PRs). If the board drawer is open, also call `refreshDetail()` for the drawer's PR. |
 | `issues` | - | `loadIssues()` to refresh list. If an issue is selected, also call `refreshFromSSE()` on the issues store for the selected issue's detail. |
-| `activity` | - | `pollNewItems()` for incremental activity feed update. |
+| `activity` | - | `loadActivity()` for full feed refresh (not `pollNewItems()` — incremental append wouldn't update existing rows whose title/state changed during sync). If an activity detail drawer is open, also call `refreshDetail()` for that item. |
 | `settings` | - | No data refresh needed. |
 
 **Board view specifics:** `KanbanBoard.svelte` has its own drawer state (`drawerPR`) that is local to the component, not in the pulls store. The events store cannot directly access this. Two options: (a) move `drawerPR` into the pulls store so the events store can check it, or (b) have the board component register a refresh callback with the events store on mount and unregister on destroy. Option (b) is simpler and doesn't require restructuring the board's local state.
@@ -304,8 +304,8 @@ The events store imports `getPage()` from the router store to determine which vi
 **Prerequisite: move component-level polling into stores.** Currently, `PullList.svelte`, `IssueList.svelte`, and `KanbanBoard.svelte` each have their own 15s `setInterval` timers that call `loadPulls()`/`loadIssues()` directly. These must be moved into their respective stores so the SSE events store can centrally control them. Without this, SSE would disable store-level polling but component-level timers would keep firing.
 
 **`pulls.svelte.ts`:**
-- New `startListPolling(overrides?)` / `stopListPolling()` functions managing a 15s timer that calls `loadPulls(overrides)`. The optional `overrides` parameter lets callers lock the timer to specific filters (e.g., `{ state: "open" }` for the board view). Replaces the `setInterval` in `PullList.svelte` and `KanbanBoard.svelte`.
-- New `enablePolling()` / `disablePolling()` to gate polling on SSE connection state. `startListPolling` checks the `pollingEnabled` flag before creating the timer.
+- New `startListPolling(overrides?)` / `stopListPolling()` functions managing a 15s timer that calls `loadPulls(overrides)`. The optional `overrides` parameter lets callers lock the timer to specific filters (e.g., `{ state: "open" }` for the board view). `startListPolling` stores the active overrides in module-level state so they survive polling toggle cycles. Replaces the `setInterval` in `PullList.svelte` and `KanbanBoard.svelte`.
+- New `enablePolling()` / `disablePolling()` to gate polling on SSE connection state. `disablePolling` clears the interval but preserves the stored overrides. `enablePolling` recreates the timer with the previously-stored overrides (so board polling restarts with `{ state: "open" }` after SSE reconnect). `startListPolling` checks the `pollingEnabled` flag before creating the timer.
 - Events store calls `loadPulls()` on `data_changed`.
 
 **`issues.svelte.ts`:**
@@ -320,10 +320,10 @@ The events store imports `getPage()` from the router store to determine which vi
 
 **`activity.svelte.ts`:**
 - New `enablePolling()` / `disablePolling()` functions with same pattern.
-- New `refreshFromSSE()` that calls the existing `pollNewItems()`.
+- New `refreshFromSSE()` that calls `loadActivity()` (full refresh, not incremental `pollNewItems()`).
 
 **`detail.svelte.ts`:**
-- New `enablePolling()` / `disablePolling()` functions with same pattern.
+- New `enablePolling()` / `disablePolling()` functions. `startDetailPolling` already stores the current target (owner/name/number) in module-level state. `disablePolling` clears the interval but preserves the stored target. `enablePolling` recreates the timer for the stored target (so detail polling restarts for the correct PR/issue after SSE reconnect).
 - New `refreshFromSSE(owner: string, name: string, number: number)` that calls the existing `refreshDetail()`.
 
 ### Connection Lifecycle
