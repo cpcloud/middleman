@@ -51,7 +51,7 @@ Methods:
 
 **Ordering guarantee:** `Subscribe` and `Broadcast` share the same `mu`, so the channel observed by a new subscriber always begins with the cached `lastSyncStatus` (if any) followed strictly by events broadcast after `Subscribe` returned. A transition broadcast that lands between a naive snapshot read and a subscribe can never sneak in ahead of the initial event, so the client cannot regress from a newer snapshot to an older buffered transition.
 
-**Priming and startup order:** Broadcasting with no subscribers is cheap (the subscriber loop is empty) and still updates `lastSyncStatus`. Priming the hub on startup must happen **before** `syncer.Start(ctx)`, or a newer callback-driven broadcast from an already-running sync could be overwritten by a later prime reading an older `Syncer.Status()` value. The required ordering in `cmd/middleman/main.go` becomes:
+**Priming and startup order:** Broadcasting with no subscribers is cheap (the subscriber loop is empty) and still updates `lastSyncStatus`. Priming the hub on startup must happen **before** `syncer.Start(ctx)`, or a newer callback-driven broadcast from an already-running sync could be overwritten by a later prime reading an older `Syncer.Status()` value. The required ordering is:
 
 1. Create the syncer (`NewSyncer`) — not yet started, `Status()` returns the zero value.
 2. Construct the server (`server.NewWithConfig`) — this creates the `EventHub`, registers the `onStatusChange` callback on the syncer via `SetOnStatusChange`, and primes the hub with `Broadcast(Event{Type: "sync_status", Data: syncer.Status()})`. Because the syncer has not started yet, no callback broadcasts can race with this prime.
@@ -59,6 +59,26 @@ Methods:
 4. Call `srv.ListenAndServe(addr)`.
 
 This ordering also guarantees that the first HTTP request on `/api/v1/events` cannot land before the prime, because the server isn't listening yet.
+
+To make this ordering testable and resistant to regression in `cmd/middleman/main.go`, extract the bootstrap logic into a helper that tests can drive directly:
+
+```go
+// cmd/middleman/app.go (or a new internal/app package if the file grows)
+type App struct {
+    Server *server.Server
+    Syncer *ghclient.Syncer
+    DB     *db.DB
+}
+
+// Bootstrap performs steps 1–2 above (create syncer, construct server which
+// primes the hub and wires the callback) without starting the syncer or
+// serving HTTP. It is the only allowed entry point for wiring the syncer,
+// server, and hub together; both main.go and the regression tests must
+// route through it.
+func Bootstrap(cfg *config.Config, ghClient ghclient.Client) (*App, error)
+```
+
+`main.go` then calls `Bootstrap`, and only after it returns successfully does it call `syncer.Start(ctx)` and `srv.ListenAndServe(addr)`. Tests call `Bootstrap` the same way, then drive the syncer manually (via a mock client with blocking list calls) to simulate an in-progress sync and assert hub state. If the only caller of `syncer.Start` outside tests is `main.go` directly after a `Bootstrap` return, a regression that reintroduces an early `syncer.Start` becomes a visible diff against this structure rather than a silent ordering bug.
 
 ### Event Types
 
@@ -404,8 +424,8 @@ When SSE is connected:
 - SSE endpoint: returns `text/event-stream` content type, receives events after broadcast, connection closes cleanly on client disconnect
 - SSE endpoint sends initial `sync_status` event: server startup primes the hub via `Broadcast(sync_status)` from `Syncer.Status()`; a new subscription's very first received event is a `sync_status` frame with that snapshot, flushed to the client before any transition-driven broadcast
 - SSE endpoint mid-sync connect: prime the hub, simulate a sync start broadcast T1, simulate a mid-sync progress broadcast T2, then open a new subscription. The first frame the client receives is T2 (the most recent), and the client never receives T1 or any older snapshot afterward. Regression guard for the "subscribe then queued older event" race.
-- SSE endpoint startup with in-progress sync (regression for priming race): use a mock GitHub client whose first list call blocks on a channel so a `RunOnce` can be stopped mid-cycle. Construct the syncer and server in the prescribed order (server BEFORE `syncer.Start`), then start the syncer. Let `RunOnce` broadcast its initial `Running: true` state to the callback, then open a new SSE subscription. The first frame the client receives is `{running: true}` (the most recent cached broadcast), not the zero-value snapshot used during priming. This confirms that callback broadcasts after `syncer.Start` correctly overwrite the earlier prime and that the prescribed ordering (prime before start) prevents a later prime from clobbering a newer broadcast.
-- SSE handler flush-on-error: wrap an `httptest.ResponseRecorder` with a custom writer whose `FlushError() error` method (the Go 1.20+ hook used by `http.NewResponseController(w).Flush()`) returns a synthetic error on the first invocation. Verify the handler returns promptly on the failing flush rather than looping on stale state.
+- SSE endpoint startup with in-progress sync (regression for priming race): call the production `Bootstrap(cfg, mockClient)` helper that `cmd/middleman/main.go` also uses. Use a mock GitHub client whose first list call blocks on a channel so a `RunOnce` can be stopped mid-cycle. After `Bootstrap` returns, call `app.Syncer.Start(ctx)` (exactly as `main.go` does), let `RunOnce` broadcast its initial `Running: true` state to the callback, then open a new SSE subscription through `app.Server`. The first frame the client receives is `{running: true}` (the most recent cached broadcast), not the zero-value snapshot used during priming. Because the test drives the real `Bootstrap` helper, a future regression that reorders `syncer.Start` before `Bootstrap` in `main.go` would also break the only supported shape of the helper and fail this test. A companion compile-time check: `main.go` must not call `syncer.Start` except on the value returned by `Bootstrap`.
+- SSE handler flush-on-error: wrap an `httptest.ResponseRecorder` with a custom writer whose `FlushError() error` method (the Go 1.20+ hook used by `http.NewResponseController(w).Flush()`) succeeds for the first N calls and returns a synthetic error on a later call. Drive the handler so that the first `rc.Flush()` (header flush in step 2) and the cached initial `sync_status` flush in the first select-loop iteration both succeed, then trigger a broadcast that causes the NEXT flush (either an event flush from step 5 or a keepalive flush from the ticker) to fail. Verify the handler returns promptly on that later flush error rather than looping on stale state. This ensures implementations cannot ignore post-write flush failures and still pass the test.
 - Syncer with `onStatusChange`: callback fires for started/progress/complete transitions
 - Syncer with `IsNotModified`: verify PR processing is skipped on 304, CI refresh still runs with cached head SHAs, issue sync still runs on PR list 304
 
@@ -437,12 +457,14 @@ When SSE is connected:
 | `internal/github/etag_transport.go` | HTTP transport with ETag injection + `IsNotModified` helper |
 | `internal/github/etag_transport_test.go` | Transport unit tests |
 | `frontend/src/lib/stores/events.svelte.ts` | SSE client and connection management |
+| `cmd/middleman/app.go` | `App` struct and `Bootstrap(cfg, ghClient)` helper that creates syncer, constructs server (primes hub, wires callback), and returns both without starting the syncer or listening. Shared entry point for `main.go` and startup ordering tests. |
+| `cmd/middleman/app_test.go` | Startup-ordering integration tests that drive `Bootstrap` directly with a mock GitHub client that blocks mid-`RunOnce`, asserting the cached `lastSyncStatus` reflects the in-progress state for new subscribers. |
 
 ### Modified Files
 | File | Change |
 |------|--------|
 | `internal/server/server.go` | Add `EventHub` field, register `GET /api/v1/events` handler using `http.NewResponseController(w)` for flushable writes, set `WriteTimeout: 0`, wire syncer callback via `SetOnStatusChange`, prime the hub with `Broadcast(sync_status)` from `syncer.Status()` during server construction |
-| `cmd/middleman/main.go` | Reorder startup so `server.NewWithConfig(...)` (which primes the hub and registers the callback) is called BEFORE `syncer.Start(ctx)`. Current order is syncer-start-then-server; new order is server-then-syncer-start-then-ListenAndServe. Prevents a later prime from clobbering a newer callback broadcast. |
+| `cmd/middleman/main.go` | Replace inline wiring with a call to `Bootstrap(cfg, ghClient)` that returns an `*App`. Only after `Bootstrap` returns does `main.go` call `app.Syncer.Start(ctx)` and `app.Server.ListenAndServe(addr)`. This makes the prime-before-start ordering enforceable by a single shared helper shared between production and tests. |
 | `internal/github/client.go` | Wrap OAuth2 transport with `etagTransport` in `NewClient` |
 | `internal/github/sync.go` | Add `onStatusChange` callback + setter, `headSHAs` cache, `IsNotModified` checks at 2 call sites, `refreshCIForExistingPRs` helper, refactor `refreshCIStatus` to take `number int, headSHA string` instead of `*gh.PullRequest` |
 | `frontend/src/lib/stores/sync.svelte.ts` | Add `updateSyncFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
