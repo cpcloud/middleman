@@ -150,7 +150,7 @@ This requires the following changes to `*server.Server`:
 - Add `httpSrv *http.Server` and `listener net.Listener` fields.
 - Add `Listen(addr string) error`: creates the `*http.Server` (SSE-friendly `WriteTimeout: 0`, existing `ReadTimeout: 15s`, `IdleTimeout: 60s`, handler = `s`), then calls `net.Listen("tcp", addr)` and stores the resulting listener. Returns any error from `net.Listen` directly to the caller. Must be called exactly once before `Serve` or `Shutdown`.
 - Add `Serve() error`: calls `s.httpSrv.Serve(s.listener)` and returns its result. Does **not** call `net.Listen` — the listener must already be bound by a prior `Listen` call, so `Serve` cannot encounter a bind error.
-- Add `Shutdown(ctx context.Context) error`: calls `s.httpSrv.Shutdown(ctx)`. `http.Server.Shutdown` also closes the underlying listener. For safety, `Shutdown` on a `Server` whose `Listen` was never called is a no-op returning `nil` (covers the test path where a `*Server` is wired as an `http.Handler` via `httptest.NewServer`).
+- Add `Shutdown(ctx context.Context) error`: first closes `s.listener` directly (ignoring the error — closing an already-closed listener returns a harmless "use of closed network connection"), then calls `s.httpSrv.Shutdown(ctx)`. Closing `s.listener` directly is necessary because `http.Server.Shutdown` only closes listeners that `Serve` has already adopted; between `Listen` and the serve goroutine entering `httpSrv.Serve(s.listener)` there is a window where the listener is bound but unadopted, and an early `ctx` cancellation would otherwise leak the socket. Closing twice is idempotent, so a normal post-serve shutdown still works: our explicit `s.listener.Close()` runs first, and `httpSrv.Shutdown` then closes the already-closed listener (no-op) plus drains connections. For the test path where `*Server` is wired purely as an `http.Handler` via `httptest.NewServer` (no `Listen` call), `Shutdown` is a no-op returning `nil` — both `httpSrv` and `listener` are nil.
 - The old `ListenAndServe(addr string) error` method is **removed** (not renamed or kept as a wrapper) to make the AST test enforceable: there must be no caller of the combined form anywhere in `cmd/middleman`.
 
 `cmd/middleman/main.go`'s `run` function is reduced to loading config, constructing the GitHub client, setting up signal-cancellation, and calling `Run`. It does not reference `app.Syncer` or `app.Server` directly; the `Run` helper sequences them.
@@ -165,7 +165,8 @@ To prevent a future edit from reintroducing the bypass (calling `Bootstrap` and 
 // method calls on receivers are recorded in Selections; Uses only
 // holds plain identifiers). It tracks the enclosing FuncDecl for each
 // call and fails if any call resolves to a method in the forbidden
-// set UNLESS the enclosing function is exactly `app.Run`.
+// set UNLESS the enclosing FuncDecl is the **specific** package-level
+// `Run` function node found during a prior pass over app.go.
 //
 // Forbidden set (receiver type + method name):
 //   - (*github.com/wesm/middleman/internal/github.Syncer).Start
@@ -174,10 +175,13 @@ To prevent a future edit from reintroducing the bypass (calling `Bootstrap` and 
 //   - (*github.com/wesm/middleman/internal/server.Server).Shutdown
 //
 // No file in cmd/middleman may reference these methods, with ONE
-// exception: the body of the single `Run` function in app.go. Even
-// Bootstrap, App methods, or any future helper inside app.go itself
-// are forbidden from touching this set — everything must go through
-// Run. main.go is therefore forced to call Run.
+// exception: the body of the single package-level `Run` function in
+// app.go (FuncDecl.Recv == nil, name == "Run", declared at file scope
+// in app.go, matching the expected signature). Bootstrap, App methods,
+// any future helper inside app.go itself, and any method named `Run`
+// on some other receiver type are all forbidden from touching this
+// set — everything must go through the specific package-level Run.
+// main.go is therefore forced to call Run.
 func TestOnlyAppRunStartsServerAndSyncer(t *testing.T) {
     cfg := &packages.Config{
         Mode: packages.NeedName | packages.NeedFiles |
@@ -186,26 +190,46 @@ func TestOnlyAppRunStartsServerAndSyncer(t *testing.T) {
         Dir:  ".",
     }
     pkgs, err := packages.Load(cfg, ".")
-    // for each non-test syntax file in pkgs[0]:
-    //   walk FuncDecl nodes; for each FuncDecl, track its Name
-    //   (and Recv) as the "enclosing function"
-    //   for each CallExpr inside the FuncDecl body:
-    //     sel, ok := call.Fun.(*ast.SelectorExpr); if !ok continue
-    //     selection := pkg.TypesInfo.Selections[sel]
-    //     if selection == nil || selection.Kind() != types.MethodVal {
-    //         continue
-    //     }
-    //     recv := selection.Recv()
-    //     key := recv.String() + "." + selection.Obj().Name()
-    //     if key in forbiddenSet && enclosing != "Run" { t.Fatalf(...) }
+    // First pass: locate the unique package-level Run FuncDecl.
+    //   var runDecl *ast.FuncDecl
+    //   for each non-test syntax file f in pkgs[0]:
+    //     if filepath.Base(pkg.Fset.File(f.Pos()).Name()) != "app.go" { continue }
+    //     for each top-level decl in f.Decls:
+    //       fd, ok := decl.(*ast.FuncDecl); if !ok continue
+    //       if fd.Recv != nil { continue }           // must not be a method
+    //       if fd.Name.Name != "Run" { continue }
+    //       if runDecl != nil { t.Fatalf("multiple Run decls") }
+    //       runDecl = fd
+    //   if runDecl == nil { t.Fatalf("no package-level Run in app.go") }
+    //   // Validate signature: (ctx context.Context, cfg *config.Config,
+    //   //   configPath string, ghClient ghclient.Client, addr string) error
+    //   // using types info from runDecl.Name's *types.Func so a rename
+    //   // or signature drift cannot silently disable the guardrail.
     //
-    // Also assert that Run exists exactly once as a package-level
-    // function in app.go with the expected signature, so a rename
-    // cannot silently disable the guardrail.
+    // Second pass: walk every non-test file and check every call.
+    //   for each non-test syntax file in pkgs[0]:
+    //     var enclosing *ast.FuncDecl
+    //     ast.Inspect(f, func(n ast.Node) bool {
+    //       if fd, ok := n.(*ast.FuncDecl); ok { enclosing = fd; return true }
+    //       call, ok := n.(*ast.CallExpr); if !ok { return true }
+    //       sel, ok := call.Fun.(*ast.SelectorExpr); if !ok { return true }
+    //       selection := pkg.TypesInfo.Selections[sel]
+    //       if selection == nil || selection.Kind() != types.MethodVal {
+    //         return true
+    //       }
+    //       recv := selection.Recv()
+    //       key := recv.String() + "." + selection.Obj().Name()
+    //       if _, forbidden := forbiddenSet[key]; !forbidden { return true }
+    //       // Pointer-identity check against the validated Run node.
+    //       // Matching on fd.Name.Name == "Run" would be spoofable by
+    //       // `func (h helper) Run(...)` elsewhere in the package.
+    //       if enclosing != runDecl { t.Fatalf(...) }
+    //       return true
+    //     })
 }
 ```
 
-Why the `Run`-only exemption (not a file-level `app.go` exemption): exempting the entire file would let a future edit add a second helper function next to `Run` inside `app.go` that does the inline wiring, and have `main.go` call that helper instead. Scoping the exemption to the `Run` function body forces all startup wiring through exactly that one function, and a rename check guards against bypass-by-rename.
+Why the `Run`-only exemption is pinned to a specific FuncDecl (not a file-level `app.go` exemption, and not a name-only check): exempting the entire file would let a future edit add a second helper function next to `Run` inside `app.go` that does the inline wiring, and have `main.go` call that helper instead. Scoping the exemption by bare name "Run" would let a future edit add a method like `func (h helper) Run(...)` anywhere in the package that inlines `Syncer.Start` / `Server.Listen` / `Server.Serve` / `Server.Shutdown` — the enclosing FuncDecl's name would still be "Run", defeating the guardrail. Pinning the exemption to the **specific AST node** identified by a first pass (file = `app.go`, `Recv == nil`, `Name == "Run"`, validated signature) forces all startup wiring through exactly that one package-level function. Signature validation guards against a rename or drift that would leave a same-named but wrong-shaped `Run` silently disabling the check.
 
 Combined with the Bootstrap regression test, this gives two independent guardrails: `app_test.go` verifies the helper correctly orders prime and start, and `main_ast_test.go` verifies every caller of the forbidden method set in the entire `cmd/middleman` package is inside the body of `Run`.
 
@@ -553,7 +577,7 @@ When SSE is connected:
 - SSE endpoint: returns `text/event-stream` content type, receives events after broadcast, connection closes cleanly on client disconnect
 - SSE endpoint sends initial `sync_status` event: server startup primes the hub via `Broadcast(sync_status)` from `Syncer.Status()`; a new subscription's very first received event is a `sync_status` frame with that snapshot, flushed to the client before any transition-driven broadcast
 - SSE endpoint mid-sync connect: prime the hub, simulate a sync start broadcast T1, simulate a mid-sync progress broadcast T2, then open a new subscription. The first frame the client receives is T2 (the most recent), and the client never receives T1 or any older snapshot afterward. Regression guard for the "subscribe then queued older event" race.
-- SSE endpoint startup with in-progress sync (regression for priming race): this is guarded by **two independent tests**. (1) `cmd/middleman/app_test.go` drives the production `Bootstrap(cfg, configPath, mockClient)` helper with a mock GitHub client whose first list call blocks on a channel so a `RunOnce` can be stopped mid-cycle. After `Bootstrap` returns, the test calls `app.Syncer.Start(ctx)`, lets `RunOnce` broadcast its initial `Running: true` state to the callback, then opens a new SSE subscription through `app.Server`. The first frame the client receives is `{running: true}` (the most recent cached broadcast), not the zero-value snapshot used during priming. (2) `cmd/middleman/main_ast_test.go` loads the entire `cmd/middleman` package with `go/packages` (type info enabled), walks every `*ast.CallExpr` in every non-test file (including `app.go`), resolves each `SelectorExpr` callee via `TypesInfo.Selections[sel]`, tracks the enclosing `FuncDecl`, and fails if any call resolves to a method in `{(*Syncer).Start, (*Server).Listen, (*Server).Serve, (*Server).Shutdown}` from a function OTHER THAN `Run` itself. The test also asserts that `Run` exists as a package-level function in `app.go` so a rename cannot silently disable the guardrail. Together: `app_test.go` verifies the helper's ordering is correct, and `main_ast_test.go` verifies every caller of the forbidden method set sits inside the body of exactly `Run`.
+- SSE endpoint startup with in-progress sync (regression for priming race): this is guarded by **two independent tests**. (1) `cmd/middleman/app_test.go` drives the production `Bootstrap(cfg, configPath, mockClient)` helper with a mock GitHub client whose first list call blocks on a channel so a `RunOnce` can be stopped mid-cycle. After `Bootstrap` returns, the test calls `app.Syncer.Start(ctx)`, lets `RunOnce` broadcast its initial `Running: true` state to the callback, then opens a new SSE subscription through `app.Server`. The first frame the client receives is `{running: true}` (the most recent cached broadcast), not the zero-value snapshot used during priming. (2) `cmd/middleman/main_ast_test.go` loads the entire `cmd/middleman` package with `go/packages` (type info enabled). A first pass over `app.go` locates the unique package-level `Run` FuncDecl (`Recv == nil`, `Name == "Run"`, validated signature), failing if none or more than one exists. A second pass walks every `*ast.CallExpr` in every non-test file (including `app.go`), resolves each `SelectorExpr` callee via `TypesInfo.Selections[sel]`, tracks the enclosing `FuncDecl`, and fails if any call resolves to a method in `{(*Syncer).Start, (*Server).Listen, (*Server).Serve, (*Server).Shutdown}` from a `FuncDecl` that is NOT pointer-identical to the `Run` node found in the first pass. Pointer identity defeats a spoofing attempt via `func (h helper) Run(...)` defined elsewhere. Together: `app_test.go` verifies the helper's ordering is correct, and `main_ast_test.go` verifies every caller of the forbidden method set sits inside the body of exactly the validated package-level `Run` FuncDecl in `app.go`.
 
 - `Run` bind-error propagation: the test creates an already-bound TCP listener on an ephemeral port, then calls `Run(ctx, cfg, cfgPath, mockClient, boundAddr)`. `Run` must return a wrapped bind error (the `"listen: …"` prefix from the synchronous `Server.Listen` call), not `nil`. Verifies that `Listen` actually calls `net.Listen` synchronously and that bind errors cannot be masked by a later `ctx.Done()`.
 - `Run` serve-error propagation after cancel: in an environment where the listener can be programmatically closed mid-serve, trigger a `Serve()` error simultaneously with `ctx` cancellation. `Run` must wait for the serve goroutine to exit and propagate the non-`ErrServerClosed` error from `errCh` instead of silently returning `nil` from the shutdown branch.
@@ -592,7 +616,7 @@ When SSE is connected:
 | `frontend/src/lib/stores/events.svelte.ts` | SSE client and connection management |
 | `cmd/middleman/app.go` | `App` struct, `Bootstrap(cfg, configPath, ghClient)` helper that creates syncer + constructs server (primes hub, wires callback) without starting the syncer or binding, and `Run(ctx, cfg, configPath, ghClient, addr)` helper that calls `Bootstrap`, starts the syncer, synchronously binds via `Server.Listen(addr)` (returning any bind error directly), runs `Server.Serve()` in a goroutine, and selects on `ctx.Done()` to invoke `Server.Shutdown` (5s deadline, waiting for the serve goroutine to exit afterward) or on a server-error channel. `Run` is the **only** function in the entire `cmd/middleman` package that may reference `Syncer.Start`, `Server.Listen`, `Server.Serve`, or `Server.Shutdown`; `Bootstrap` is exposed separately so tests can inspect hub state between construction and start but must not call any of those lifecycle methods. |
 | `cmd/middleman/app_test.go` | Startup-ordering integration tests that drive `Bootstrap` directly with a mock GitHub client that blocks mid-`RunOnce`, asserting the cached `lastSyncStatus` reflects the in-progress state for new subscribers. Also contains the `Run` bind-error, serve-error, and shutdown happy-path tests described in the Testing section. |
-| `cmd/middleman/main_ast_test.go` | Type-aware regression test using `go/packages`: loads the entire `cmd/middleman` package with type info, walks every `*ast.CallExpr` in every non-test file **including `app.go`**, tracks the enclosing `FuncDecl`, resolves each `SelectorExpr` callee via `TypesInfo.Selections[sel]`, and fails the build if any call to `(*Syncer).Start`, `(*Server).Listen`, `(*Server).Serve`, or `(*Server).Shutdown` occurs outside the body of the single `Run` function. Also asserts `Run` exists as a package-level function with the expected signature so a rename cannot silently disable the guardrail. Prevents bypass not only via a new sibling helper file but also via a new function added inside `app.go` itself. |
+| `cmd/middleman/main_ast_test.go` | Type-aware regression test using `go/packages`: loads the entire `cmd/middleman` package with type info. A first pass locates the unique package-level `Run` FuncDecl in `app.go` (`Recv == nil`, `Name == "Run"`, validated signature) — failing if none or more than one exists. A second pass walks every `*ast.CallExpr` in every non-test file **including `app.go`**, tracks the enclosing `FuncDecl`, resolves each `SelectorExpr` callee via `TypesInfo.Selections[sel]`, and fails the build if any call to `(*Syncer).Start`, `(*Server).Listen`, `(*Server).Serve`, or `(*Server).Shutdown` occurs inside a `FuncDecl` that is not pointer-identical to the validated `Run` node. Pointer identity prevents a bypass via a method such as `func (h helper) Run(...)` defined elsewhere in the package that would satisfy a name-only check. Prevents bypass via a new sibling helper file, a new function added inside `app.go` itself, or a same-named method on another receiver. |
 
 ### Modified Files
 | File | Change |
