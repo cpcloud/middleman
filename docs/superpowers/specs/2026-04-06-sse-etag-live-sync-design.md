@@ -137,14 +137,18 @@ type etagEntry struct {
 ```
 
 `RoundTrip(req)`:
-1. Check if this is a paginated later-page request: if the URL has a `page` query parameter with value > 1, skip ETag handling entirely — pass through to the base transport.
+1. Check if this is a paginated later-page request: if the URL has a `page` query parameter with value > 1, skip ETag handling entirely — pass through to the base transport and return.
 2. Look up `req.URL.String()` in cache. If found, clone the request and add `If-None-Match: <etag>` header (must clone to avoid mutating the original).
 3. Call `base.RoundTrip(req)` with the (possibly modified) request.
-4. On 200: store the response `ETag` header value in cache (if present). Return response.
+4. On 200: if the response has an `ETag` header AND does NOT have a `Link` header containing `rel="next"` (indicating this is a single-page result), store the ETag in cache. If the response IS multi-page (has `Link: next`), do NOT cache the ETag — this ensures multi-page endpoints always fetch fresh on the next cycle.
 5. On 304: return response as-is (empty body, 304 status).
 6. On other status: return response as-is.
 
-The page-check in step 1 prevents a correctness bug with paginated endpoints: go-github's first page request has no `page` parameter, while subsequent pages have `page=2`, `page=3`, etc. Without this check, a cached ETag for page 2 could cause a 304 on a subsequent cycle even when page 1 returned 200 (indicating changes), causing `collectPages` to abort and discard real page-1 data.
+**Why two pagination guards:**
+- Step 1 (page parameter check) prevents later pages from caching or using stale ETags. go-github's first page request has no `page` parameter, while subsequent pages have `page=2`, `page=3`, etc.
+- Step 4 (Link: next check) prevents the first page of multi-page results from being cached. Without this, a repo with >100 PRs would cache page 1's ETag, and subsequent 304s would skip the entire list — missing changes to PRs on later pages indefinitely.
+
+Both guards are self-contained in the transport. No syncer, client, or collectPages changes are needed for multi-page handling.
 
 ### Not-Modified Detection
 
@@ -229,26 +233,13 @@ Issues have no independent background updates (unlike CI), so 304 means skip ent
 
 ### Pagination and ETags
 
-`ListOpenPullRequests` and `ListOpenIssues` use `collectPages`. The ETag transport only caches ETags for first-page requests (URLs without a `page` query parameter). Later pages (`page=2`, `page=3`, etc.) bypass ETag handling entirely and always fetch fresh data.
+`ListOpenPullRequests` and `ListOpenIssues` use `collectPages`. The ETag transport handles pagination entirely on its own — no syncer, client, or `collectPages` changes needed.
 
-This design prevents a correctness bug: if page 1 returns 200 (data changed) but page 2 had a stale cached ETag and returned 304, `collectPages` would abort with a not-modified error, discarding the real page-1 changes.
+**Later pages bypass ETags:** URLs with a `page` query parameter > 1 skip ETag handling entirely (no `If-None-Match` sent, no ETag stored). go-github's first-page request has no `page` parameter; subsequent pages have `page=2`, `page=3`, etc. This prevents a correctness bug: if page 1 returns 200 (data changed) but page 2 had a stale cached ETag and returned 304, `collectPages` would abort with a not-modified error, discarding the real page-1 changes.
 
-When the first page returns 304, `collectPages` returns the not-modified error immediately. The caller treats the entire list as unchanged and skips processing.
+**Multi-page first pages are not cached:** The transport checks the `Link` response header for `rel="next"`. If present, the response spans multiple pages, and the transport does NOT cache the ETag. This prevents indefinite staleness: a cached ETag on page 1 would cause 304s that skip the entire list, missing changes to items on later pages.
 
-**Multi-page repos are excluded from ETag caching.** The syncer tracks whether each list endpoint's last successful response required pagination (i.e., `collectPages` made more than one request). If a repo's PR list or issue list spanned multiple pages on the last 200 response, the syncer tells the transport to skip ETag handling for that endpoint on subsequent cycles (by adding a flag to the request context or using a per-repo skiplist). This avoids indefinite staleness: a 304 on page 1 only proves page 1's content is unchanged, but changes to PRs beyond page 1 would be missed indefinitely since page 1's ETag may never change.
-
-Implementation: the Syncer tracks which endpoints returned multi-page results. After each successful `collectPages` call, if it fetched more than one page, the Syncer evicts the cached ETag for that endpoint's first-page URL from the transport. This ensures the next cycle fetches fresh data. The transport exposes an `Evict(url string)` method for this purpose.
-
-```go
-// On the Syncer, after collectPages returns successfully:
-if pageCount > 1 {
-    s.client.EvictETag(firstPageURL)
-}
-```
-
-The `Client` interface gains an `EvictETag(url string)` method. The `liveClient` delegates to the transport's `Evict`. Mock clients can no-op.
-
-Single-page repos (the common case) get full ETag benefit. Multi-page repos always fetch fresh. `ListOpenIssues` sorts by `updated_at DESC`, so the most recently updated issue always appears on page 1. Even so, the multi-page exclusion applies uniformly for simplicity.
+When the first page returns 304, `collectPages` returns the not-modified error immediately. The caller treats the entire list as unchanged and skips processing. Single-page repos (the common case) get full ETag benefit. Multi-page repos always fetch fresh.
 
 ### ETag Cache Lifetime
 
@@ -303,7 +294,7 @@ The events store imports `getPage()` from the router store to determine which vi
 **Prerequisite: move component-level polling into stores.** Currently, `PullList.svelte`, `IssueList.svelte`, and `KanbanBoard.svelte` each have their own 15s `setInterval` timers that call `loadPulls()`/`loadIssues()` directly. These must be moved into their respective stores so the SSE events store can centrally control them. Without this, SSE would disable store-level polling but component-level timers would keep firing.
 
 **`pulls.svelte.ts`:**
-- New `startListPolling()` / `stopListPolling()` functions managing a 15s timer that calls `loadPulls()`. Replaces the `setInterval` in `PullList.svelte` and `KanbanBoard.svelte`.
+- New `startListPolling(overrides?)` / `stopListPolling()` functions managing a 15s timer that calls `loadPulls(overrides)`. The optional `overrides` parameter lets callers lock the timer to specific filters (e.g., `{ state: "open" }` for the board view). Replaces the `setInterval` in `PullList.svelte` and `KanbanBoard.svelte`.
 - New `enablePolling()` / `disablePolling()` to gate polling on SSE connection state. `startListPolling` checks the `pollingEnabled` flag before creating the timer.
 - Events store calls `loadPulls()` on `data_changed`.
 
@@ -402,8 +393,7 @@ When SSE is connected:
 | File | Change |
 |------|--------|
 | `internal/server/server.go` | Add `EventHub` field, register `GET /api/v1/events` handler, set `WriteTimeout: 0`, wire syncer callback via `SetOnStatusChange` |
-| `internal/github/client.go` | Wrap OAuth2 transport with `etagTransport` in `NewClient`, add `EvictETag` to `Client` interface and `liveClient` |
-| `internal/github/client_helpers.go` | `collectPages` returns page count alongside results for multi-page detection |
+| `internal/github/client.go` | Wrap OAuth2 transport with `etagTransport` in `NewClient` |
 | `internal/github/sync.go` | Add `onStatusChange` callback + setter, `headSHAs` cache, `IsNotModified` checks at 2 call sites, `refreshCIForExistingPRs` helper, refactor `refreshCIStatus` to take `number int, headSHA string` instead of `*gh.PullRequest` |
 | `frontend/src/lib/stores/sync.svelte.ts` | Add `updateSyncFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
 | `frontend/src/lib/stores/activity.svelte.ts` | Add `refreshFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
@@ -412,5 +402,5 @@ When SSE is connected:
 | `frontend/src/lib/stores/pulls.svelte.ts` | Add `startListPolling`/`stopListPolling`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
 | `frontend/src/lib/components/sidebar/PullList.svelte` | Remove 15s `setInterval`, call `startListPolling`/`stopListPolling` from pulls store |
 | `frontend/src/lib/components/sidebar/IssueList.svelte` | Remove 15s `setInterval`, call `startListPolling`/`stopListPolling` from issues store |
-| `frontend/src/lib/components/kanban/KanbanBoard.svelte` | Remove 15s `setInterval`, call `startListPolling`/`stopListPolling` from pulls store |
+| `frontend/src/lib/components/kanban/KanbanBoard.svelte` | Remove 15s `setInterval`, call `startListPolling({ state: "open" })`/`stopListPolling` from pulls store |
 | `frontend/src/App.svelte` | Call `connect()` on mount, `disconnect()` on destroy |
