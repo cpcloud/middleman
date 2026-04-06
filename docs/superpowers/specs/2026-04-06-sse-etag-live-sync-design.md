@@ -235,7 +235,20 @@ This design prevents a correctness bug: if page 1 returns 200 (data changed) but
 
 When the first page returns 304, `collectPages` returns the not-modified error immediately. The caller treats the entire list as unchanged and skips processing.
 
-**Known limitation for multi-page results:** `ListOpenPullRequests` sorts by creation date (GitHub default). A 304 on page 1 only proves page 1's content is unchanged. If a PR beyond page 1 is updated (e.g., gets a new comment), page 1's ETag may not change, causing the update to be missed for one sync cycle. This is acceptable for middleman's target use case (small repo set -- most repos have <100 open PRs, fitting in a single page). `ListOpenIssues` sorts by `updated_at DESC`, so the most recently updated issue always appears on page 1 and this limitation does not apply.
+**Multi-page repos are excluded from ETag caching.** The syncer tracks whether each list endpoint's last successful response required pagination (i.e., `collectPages` made more than one request). If a repo's PR list or issue list spanned multiple pages on the last 200 response, the syncer tells the transport to skip ETag handling for that endpoint on subsequent cycles (by adding a flag to the request context or using a per-repo skiplist). This avoids indefinite staleness: a 304 on page 1 only proves page 1's content is unchanged, but changes to PRs beyond page 1 would be missed indefinitely since page 1's ETag may never change.
+
+Implementation: the Syncer tracks which endpoints returned multi-page results. After each successful `collectPages` call, if it fetched more than one page, the Syncer evicts the cached ETag for that endpoint's first-page URL from the transport. This ensures the next cycle fetches fresh data. The transport exposes an `Evict(url string)` method for this purpose.
+
+```go
+// On the Syncer, after collectPages returns successfully:
+if pageCount > 1 {
+    s.client.EvictETag(firstPageURL)
+}
+```
+
+The `Client` interface gains an `EvictETag(url string)` method. The `liveClient` delegates to the transport's `Evict`. Mock clients can no-op.
+
+Single-page repos (the common case) get full ETag benefit. Multi-page repos always fetch fresh. `ListOpenIssues` sorts by `updated_at DESC`, so the most recently updated issue always appears on page 1. Even so, the multi-page exclusion applies uniformly for simplicity.
 
 ### ETag Cache Lifetime
 
@@ -266,21 +279,24 @@ export function isSSEConnected(): boolean
 - Registers event listeners:
   - `sync_status`: parse JSON payload, call `updateSyncFromSSE(status)` on sync store
   - `data_changed`: call refresh functions based on current view (see below)
-  - `open`: set `connected = true`, call `disablePolling()` on sync/activity/detail stores
-  - `error`: set `connected = false`, call `enablePolling()` on sync/activity/detail stores. EventSource handles reconnection automatically.
+  - `open`: set `connected = true`, call `disablePolling()` on all stores with polling (sync, activity, detail, pulls, issues)
+  - `error`: set `connected = false`, call `enablePolling()` on all stores with polling (sync, activity, detail, pulls, issues). EventSource handles reconnection automatically.
 
 **View-aware refresh on `data_changed`:**
 
 The events store imports `getPage()` from the router store to determine which views are active:
 
-| Current page | Actions on `data_changed` |
-|-------------|--------------------------|
-| `pulls` | `loadPulls()` to refresh sidebar/list. If a PR detail is selected (`getSelectedPR()` is non-null), also call `refreshDetail()` with that PR's owner/name/number. |
-| `issues` | `loadIssues()` to refresh list. If an issue is selected, also call `refreshFromSSE()` on the issues store for the selected issue's detail. |
-| `activity` | `pollNewItems()` for incremental activity feed update. |
-| `settings` | No data refresh needed. |
+| Current page | View | Actions on `data_changed` |
+|-------------|------|--------------------------|
+| `pulls` | list | `loadPulls()` to refresh sidebar/list. If a PR detail is selected (`getSelectedPR()` is non-null), also call `refreshDetail()` with that PR's owner/name/number. |
+| `pulls` | board | `loadPulls({ state: "open" })` (board always shows open PRs). If the board drawer is open, also call `refreshDetail()` for the drawer's PR. |
+| `issues` | - | `loadIssues()` to refresh list. If an issue is selected, also call `refreshFromSSE()` on the issues store for the selected issue's detail. |
+| `activity` | - | `pollNewItems()` for incremental activity feed update. |
+| `settings` | - | No data refresh needed. |
 
-`loadPulls()` is always called on `data_changed` regardless of current page, since the sidebar PR count badges are visible on all pages. (If this becomes a performance concern, it can be gated to pulls/activity pages only.)
+**Board view specifics:** `KanbanBoard.svelte` has its own drawer state (`drawerPR`) that is local to the component, not in the pulls store. The events store cannot directly access this. Two options: (a) move `drawerPR` into the pulls store so the events store can check it, or (b) have the board component register a refresh callback with the events store on mount and unregister on destroy. Option (b) is simpler and doesn't require restructuring the board's local state.
+
+`loadPulls()` is always called on `data_changed` regardless of current page, since the sidebar PR count badges are visible on all pages. When on the board view, the events store calls `loadPulls({ state: "open" })` instead of the generic `loadPulls()` to match the board's filter. The `getView()` helper from the router store distinguishes list from board.
 
 ### Store Changes
 
@@ -386,7 +402,8 @@ When SSE is connected:
 | File | Change |
 |------|--------|
 | `internal/server/server.go` | Add `EventHub` field, register `GET /api/v1/events` handler, set `WriteTimeout: 0`, wire syncer callback via `SetOnStatusChange` |
-| `internal/github/client.go` | Wrap OAuth2 transport with `etagTransport` in `NewClient` |
+| `internal/github/client.go` | Wrap OAuth2 transport with `etagTransport` in `NewClient`, add `EvictETag` to `Client` interface and `liveClient` |
+| `internal/github/client_helpers.go` | `collectPages` returns page count alongside results for multi-page detection |
 | `internal/github/sync.go` | Add `onStatusChange` callback + setter, `headSHAs` cache, `IsNotModified` checks at 2 call sites, `refreshCIForExistingPRs` helper, refactor `refreshCIStatus` to take `number int, headSHA string` instead of `*gh.PullRequest` |
 | `frontend/src/lib/stores/sync.svelte.ts` | Add `updateSyncFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
 | `frontend/src/lib/stores/activity.svelte.ts` | Add `refreshFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
