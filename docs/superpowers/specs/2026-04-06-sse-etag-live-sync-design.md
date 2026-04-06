@@ -65,9 +65,10 @@ Handler:
 1. Set headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`
 2. Assert `http.Flusher` interface, flush headers immediately
 3. Subscribe to hub with `r.Context()`
-4. Start a 30s keepalive ticker
-5. Select loop: on channel event, marshal to SSE wire format (`event: <type>\ndata: <json>\n\n`), write, flush. On ticker, write SSE comment (`: keepalive\n\n`), flush. If write returns error, return (client disconnected). On context cancel, return.
-6. Keepalive ticker is stopped via defer
+4. Send an initial `sync_status` event with the current `Syncer.Status()` snapshot, marshalled in the same `event: sync_status\ndata: <json>\n\n` format. This primes the client before any transition-driven broadcast, so a client that connects while no sync is running still learns the current state (last run time, last error, running=false). Without this, the events store disables sync polling on `open`, `startPolling()` in `App.svelte` becomes a no-op under the polling gate, and the status bar can sit at "not synced" or null until the next sync transition.
+5. Start a 30s keepalive ticker
+6. Select loop: on channel event, marshal to SSE wire format (`event: <type>\ndata: <json>\n\n`), write, flush. On ticker, write SSE comment (`: keepalive\n\n`), flush. If write returns error, return (client disconnected). On context cancel, return.
+7. Keepalive ticker is stopped via defer
 
 SSE is exempt from CSRF checks (GET request -- the existing CSRF check in `ServeHTTP` only applies to non-GET methods).
 
@@ -287,19 +288,19 @@ export function isSSEConnected(): boolean
 
 The events store imports `getPage()` from the router store to determine which views are active:
 
-| Current page | View | Actions on `data_changed` |
+| Current page | View | Actions on `data_changed` (in addition to global refreshes below) |
 |-------------|------|--------------------------|
-| `pulls` | list | `loadPulls()` to refresh sidebar/list. If a PR detail is selected (`getSelectedPR()` is non-null), also call `refreshDetail()` with that PR's owner/name/number. |
-| `pulls` | board | `loadPulls({ state: "open" })` (board always shows open PRs). If the board drawer is open, also call `refreshDetail()` for the drawer's PR. |
-| `issues` | - | `loadIssues()` to refresh list. If an issue is selected, also call `refreshFromSSE()` on the issues store for the selected issue's detail. |
+| `pulls` | list | If a PR detail is selected (`getSelectedPR()` is non-null), call `refreshDetail()` with that PR's owner/name/number. |
+| `pulls` | board | If the board drawer is open, call `refreshDetail()` for the drawer's PR. |
+| `issues` | - | If an issue is selected, call `refreshFromSSE()` on the issues store for the selected issue's detail. |
 | `activity` | - | `loadActivity()` for full feed refresh (not `pollNewItems()` — incremental append wouldn't update existing rows whose title/state changed during sync). If an activity detail drawer is open, fire the registered refresh callback (see below). |
-| `settings` | - | No data refresh needed. |
+| `settings` | - | No additional refresh needed. |
+
+**Global refreshes:** `loadPulls()` AND `loadIssues()` are always called on `data_changed` regardless of current page. The status bar (`StatusBar.svelte`) is part of the layout chrome and visible on every page; it reads `getPulls().length`, `getIssues().length`, and a `repoCount()` derived from both stores. Without global refreshes, the counts would go stale on `activity`, `pulls`, and `settings` after background syncs change issue state. When on the board view, the events store calls `loadPulls({ state: "open" })` instead of the generic `loadPulls()` to match the board's filter. The `getView()` helper from the router store distinguishes list from board.
 
 **Board view specifics:** `KanbanBoard.svelte` has its own drawer state (`drawerPR`) that is local to the component, not in the pulls store. The events store cannot directly access this. Two options: (a) move `drawerPR` into the pulls store so the events store can check it, or (b) have the board component register a refresh callback with the events store on mount and unregister on destroy. Option (b) is simpler and doesn't require restructuring the board's local state.
 
 **Activity drawer specifics:** Activity selection lives in `App.svelte` local state (plus the `?selected=...` query parameter), not in the router store. Activity items can be either PRs or issues, so the refresh path must branch: PR items call `detail.refreshFromSSE(owner, name, number)`, issue items call `issues.refreshFromSSE(owner, name, number)`. Same callback pattern as the board: `App.svelte` registers a refresh callback with the events store on mount that checks the current selection type and calls the appropriate store. Unregisters on destroy.
-
-`loadPulls()` is always called on `data_changed` regardless of current page, since the sidebar PR count badges are visible on all pages. When on the board view, the events store calls `loadPulls({ state: "open" })` instead of the generic `loadPulls()` to match the board's filter. The `getView()` helper from the router store distinguishes list from board.
 
 ### Store Changes
 
@@ -385,6 +386,7 @@ When SSE is connected:
 
 **Integration tests:**
 - SSE endpoint: returns `text/event-stream` content type, receives events after broadcast, connection closes cleanly on client disconnect
+- SSE endpoint sends initial `sync_status` event: new subscription receives a `sync_status` event containing the current `Syncer.Status()` snapshot before any broadcast fires (covers the idle-at-connect case where no transition is pending)
 - Syncer with `onStatusChange`: callback fires for started/progress/complete transitions
 - Syncer with `IsNotModified`: verify PR processing is skipped on 304, CI refresh still runs with cached head SHAs, issue sync still runs on PR list 304
 
@@ -401,6 +403,8 @@ When SSE is connected:
 - `updateSyncFromSSE` idle-to-running transition: `pollingEnabled = false` (SSE connected), `currentIntervalMs = 30000`, SSE delivers `{ running: true }` → `currentIntervalMs` updates to 2000. Calling `enablePolling()` after this creates the fallback timer at 2000ms, not 30000ms
 - `updateSyncFromSSE` running-to-idle transition: `pollingEnabled = false`, `currentIntervalMs = 2000`, SSE delivers `{ running: false }` → `currentIntervalMs` updates to 30000 AND `onSyncComplete` callback fires. Calling `enablePolling()` after this creates the fallback timer at 30000ms
 - View-aware refresh: `data_changed` triggers correct store functions based on current page
+- Global refresh: `data_changed` calls both `loadPulls()` AND `loadIssues()` on every page (pulls, issues, activity, settings) to keep status-bar counts current
+- Initial sync prime: SSE opens while sync store has `syncState = null`; the server's initial `sync_status` event populates `syncState` via `updateSyncFromSSE` even though polling is disabled and `startPolling()` is gated off
 
 ---
 
