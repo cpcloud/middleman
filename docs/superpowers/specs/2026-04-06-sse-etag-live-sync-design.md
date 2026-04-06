@@ -38,15 +38,20 @@ type Event struct {
 }
 
 type EventHub struct {
-    mu          sync.Mutex
-    subscribers map[uint64]chan Event
-    nextID      uint64
+    mu             sync.Mutex
+    subscribers    map[uint64]chan Event
+    nextID         uint64
+    lastSyncStatus *Event // most recent sync_status event, cached for new subscribers
 }
 ```
 
 Methods:
-- `Subscribe(ctx context.Context) <-chan Event` -- creates a buffered channel (buffer size 16), registers it, spawns a goroutine that removes the subscriber when ctx is canceled. Returns the channel.
-- `Broadcast(event Event)` -- iterates subscribers under lock, non-blocking send to each channel. Drops events for slow consumers (full channel).
+- `Subscribe(ctx context.Context) <-chan Event` -- under `mu`, creates a buffered channel (buffer size 16), pre-loads `lastSyncStatus` into the channel if non-nil, registers the channel, and releases the lock. Spawns a goroutine that removes the subscriber and closes the channel when ctx is canceled. Returns the channel.
+- `Broadcast(event Event)` -- under `mu`, updates `lastSyncStatus` if `event.Type == "sync_status"` (stored by value), then iterates subscribers with a non-blocking send to each channel. Drops events for slow consumers (full channel).
+
+**Ordering guarantee:** `Subscribe` and `Broadcast` share the same `mu`, so the channel observed by a new subscriber always begins with the cached `lastSyncStatus` (if any) followed strictly by events broadcast after `Subscribe` returned. A transition broadcast that lands between a naive snapshot read and a subscribe can never sneak in ahead of the initial event, so the client cannot regress from a newer snapshot to an older buffered transition.
+
+**Priming:** Broadcasting with no subscribers is cheap (the subscriber loop is empty) and still updates `lastSyncStatus`. The server primes the hub on startup before `ListenAndServe` by calling `hub.Broadcast(Event{Type: "sync_status", Data: syncer.Status()})` once, so the very first subscriber still receives a cached entry even if no sync has occurred yet.
 
 ### Event Types
 
@@ -64,11 +69,10 @@ Note: `data_changed` fires after every sync completion, even when ETags caused a
 Handler:
 1. Set headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`
 2. Assert `http.Flusher` interface, flush headers immediately
-3. Subscribe to hub with `r.Context()`
-4. Send an initial `sync_status` event with the current `Syncer.Status()` snapshot, marshalled in the same `event: sync_status\ndata: <json>\n\n` format. This primes the client before any transition-driven broadcast, so a client that connects while no sync is running still learns the current state (last run time, last error, running=false). Without this, the events store disables sync polling on `open`, `startPolling()` in `App.svelte` becomes a no-op under the polling gate, and the status bar can sit at "not synced" or null until the next sync transition.
-5. Start a 30s keepalive ticker
-6. Select loop: on channel event, marshal to SSE wire format (`event: <type>\ndata: <json>\n\n`), write, flush. On ticker, write SSE comment (`: keepalive\n\n`), flush. If write returns error, return (client disconnected). On context cancel, return.
-7. Keepalive ticker is stopped via defer
+3. Subscribe to hub with `r.Context()`. Because the hub pre-loads the cached `lastSyncStatus` into the new channel under the broadcast lock (see Event Hub), the very first receive from the channel in step 4's select loop is a `sync_status` event carrying the current state. The handler doesn't need to fetch `Syncer.Status()` separately, and there is no window between snapshot read and subscribe.
+4. Start a 30s keepalive ticker
+5. Select loop: on channel event, marshal to SSE wire format (`event: <type>\ndata: <json>\n\n`), write, flush. If write or flush fails, return immediately (client disconnected). On ticker, write SSE comment (`: keepalive\n\n`), flush, return on failure. On context cancel, return. The very first iteration of this loop will drain the cached `sync_status` from the channel and flush it out, so the client receives the current state immediately after the headers — no separate "write then flush" step outside the loop is required.
+6. Keepalive ticker is stopped via defer
 
 SSE is exempt from CSRF checks (GET request -- the existing CSRF check in `ServeHTTP` only applies to non-GET methods).
 
@@ -370,6 +374,11 @@ When SSE is connected:
 - Unsubscribe on context cancel (no goroutine leak)
 - Concurrent broadcast safety (multiple goroutines broadcasting)
 - Slow consumer (full channel) doesn't block other subscribers
+- `Broadcast` with a `sync_status` event updates the cached `lastSyncStatus`; subsequent `Subscribe` receives that event as the first channel value
+- `Broadcast` with non-`sync_status` events (e.g. `data_changed`) does NOT update `lastSyncStatus`
+- With no prior broadcast, a new `Subscribe` returns a channel with no pre-loaded event (nil cache)
+- Ordering: subscriber A connects, receives cached X, then broadcaster sends Y under the same lock → A's channel contains [X, Y] in that order
+- Mid-sync connect: broadcast sync_status T1 (seeds cache), broadcast sync_status T2 (updates cache), Subscribe → new subscriber's first event is T2, never T1
 
 **`internal/github/etag_transport_test.go`:**
 - 200 response stores ETag from header
@@ -386,7 +395,9 @@ When SSE is connected:
 
 **Integration tests:**
 - SSE endpoint: returns `text/event-stream` content type, receives events after broadcast, connection closes cleanly on client disconnect
-- SSE endpoint sends initial `sync_status` event: new subscription receives a `sync_status` event containing the current `Syncer.Status()` snapshot before any broadcast fires (covers the idle-at-connect case where no transition is pending)
+- SSE endpoint sends initial `sync_status` event: server startup primes the hub via `Broadcast(sync_status)` from `Syncer.Status()`; a new subscription's very first received event is a `sync_status` frame with that snapshot, flushed to the client before any transition-driven broadcast
+- SSE endpoint mid-sync connect: prime the hub, simulate a sync start broadcast T1, simulate a mid-sync progress broadcast T2, then open a new subscription. The first frame the client receives is T2 (the most recent), and the client never receives T1 or any older snapshot afterward. Regression guard for the "subscribe then queued older event" race.
+- SSE handler flush-on-error: mock a `ResponseWriter` whose first `Flush()` (covering the cached initial frame) returns an error; handler returns promptly rather than looping on stale state.
 - Syncer with `onStatusChange`: callback fires for started/progress/complete transitions
 - Syncer with `IsNotModified`: verify PR processing is skipped on 304, CI refresh still runs with cached head SHAs, issue sync still runs on PR list 304
 
@@ -404,7 +415,7 @@ When SSE is connected:
 - `updateSyncFromSSE` running-to-idle transition: `pollingEnabled = false`, `currentIntervalMs = 2000`, SSE delivers `{ running: false }` → `currentIntervalMs` updates to 30000 AND `onSyncComplete` callback fires. Calling `enablePolling()` after this creates the fallback timer at 30000ms
 - View-aware refresh: `data_changed` triggers correct store functions based on current page
 - Global refresh: `data_changed` calls both `loadPulls()` AND `loadIssues()` on every page (pulls, issues, activity, settings) to keep status-bar counts current
-- Initial sync prime: SSE opens while sync store has `syncState = null`; the server's initial `sync_status` event populates `syncState` via `updateSyncFromSSE` even though polling is disabled and `startPolling()` is gated off
+- Initial sync prime: SSE opens while sync store has `syncState = null` and `pollingEnabled = false` (because `open` fires disablePolling on all stores); the events store receives a `sync_status` frame as the first message on the EventSource (that frame is the hub's cached snapshot) and calls `updateSyncFromSSE`, which populates `syncState` and updates `currentIntervalMs` even though polling stays disabled. Subsequent `enablePolling()` would then create the fallback timer at the correct cadence.
 
 ---
 
@@ -422,7 +433,7 @@ When SSE is connected:
 ### Modified Files
 | File | Change |
 |------|--------|
-| `internal/server/server.go` | Add `EventHub` field, register `GET /api/v1/events` handler, set `WriteTimeout: 0`, wire syncer callback via `SetOnStatusChange` |
+| `internal/server/server.go` | Add `EventHub` field, register `GET /api/v1/events` handler, set `WriteTimeout: 0`, wire syncer callback via `SetOnStatusChange`, prime the hub with `Broadcast(sync_status)` from `syncer.Status()` before `ListenAndServe` |
 | `internal/github/client.go` | Wrap OAuth2 transport with `etagTransport` in `NewClient` |
 | `internal/github/sync.go` | Add `onStatusChange` callback + setter, `headSHAs` cache, `IsNotModified` checks at 2 call sites, `refreshCIForExistingPRs` helper, refactor `refreshCIStatus` to take `number int, headSHA string` instead of `*gh.PullRequest` |
 | `frontend/src/lib/stores/sync.svelte.ts` | Add `updateSyncFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
