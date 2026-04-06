@@ -148,7 +148,7 @@ const etagTTL = 30 * time.Minute
 2. Look up `req.URL.String()` in cache. If found AND not expired (`time.Since(entry.cachedAt) < etagTTL`), clone the request and add `If-None-Match: <etag>` header (must clone to avoid mutating the original). If expired, delete the entry and proceed as uncached.
 3. Call `base.RoundTrip(req)` with the (possibly modified) request.
 4. On 200: if the response has an `ETag` header AND does NOT have a `Link` header containing `rel="next"` (indicating this is a single-page result), store the ETag in cache with `cachedAt: time.Now()`. If the response IS multi-page (has `Link: next`), delete any previously-cached ETag for this URL (`cache.Delete(url)`) — this evicts stale entries from when the endpoint was single-page and ensures multi-page endpoints always fetch fresh on the next cycle.
-5. On 304: return response as-is (empty body, 304 status).
+5. On 304: return response as-is (empty body, 304 status). Do NOT update `cachedAt` — the entry must age out so the TTL can eventually force an unconditional fetch.
 6. On other status: return response as-is.
 
 **Three pagination safeguards:**
@@ -368,13 +368,14 @@ When SSE is connected:
 **`internal/github/etag_transport_test.go`:**
 - 200 response stores ETag from header
 - Subsequent request to same URL includes `If-None-Match` header
-- 304 response returned as-is (status preserved)
+- 304 response returned as-is (status preserved), does NOT refresh `cachedAt` timestamp
 - Different URLs get independent ETag entries
 - Request without cached ETag has no `If-None-Match` header
 - Requests with `page` query parameter > 1 bypass ETag handling (no `If-None-Match` sent, no ETag stored)
 - 200 response with `Link: rel="next"` evicts any previously-cached ETag for that URL
 - Single-page → multi-page → single-page transition: ETag cached on single-page, evicted on multi-page detection, re-cached when back to single-page
 - Expired ETag entries (older than `etagTTL`) are treated as uncached
+- TTL-driven multi-page detection: cached single-page ETag, one or more 304s (which must NOT refresh `cachedAt`), then after `etagTTL` the next request omits `If-None-Match`, gets a 200 with `Link: rel="next"`, and evicts the cache entry
 - `IsNotModified` returns true for 304 errors, false for other errors
 
 **Integration tests:**
