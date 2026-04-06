@@ -80,10 +80,11 @@ type App struct {
 func Bootstrap(cfg *config.Config, configPath string, ghClient ghclient.Client) (*App, error)
 
 // Run is the only entry point `cmd/middleman/main.go` may use. It calls
-// Bootstrap, then Syncer.Start(ctx), then Server.ListenAndServe(addr),
-// in that exact order. Returning from Run implies ListenAndServe
-// returned (normally or with an error); callers should also stop the
-// syncer via context cancellation.
+// Bootstrap, starts the syncer, runs ListenAndServe in a goroutine, then
+// selects on ctx.Done() (triggering a graceful shutdown) or a server
+// error. Returns nil if shutdown was triggered by ctx cancellation and
+// ListenAndServe returned http.ErrServerClosed, or the wrapped error
+// otherwise.
 func Run(ctx context.Context, cfg *config.Config, configPath string, ghClient ghclient.Client, addr string) error {
     app, err := Bootstrap(cfg, configPath, ghClient)
     if err != nil {
@@ -92,28 +93,58 @@ func Run(ctx context.Context, cfg *config.Config, configPath string, ghClient gh
     defer app.DB.Close()
     app.Syncer.Start(ctx)
     defer app.Syncer.Stop()
-    return app.Server.ListenAndServe(addr)
+
+    errCh := make(chan error, 1)
+    go func() {
+        if err := app.Server.ListenAndServe(addr); !errors.Is(err, http.ErrServerClosed) {
+            errCh <- err
+        }
+    }()
+
+    select {
+    case <-ctx.Done():
+        shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
+        return app.Server.Shutdown(shutdownCtx)
+    case err := <-errCh:
+        return fmt.Errorf("server: %w", err)
+    }
 }
 ```
+
+`Run` preserves the current shutdown behavior from `cmd/middleman/main.go`: SIGINT/SIGTERM cancels `ctx`, which unblocks the `select` and calls `Server.Shutdown(...)` with a 5s deadline. This requires a new `Shutdown(ctx) error` method on `*server.Server` and a stored `httpSrv *http.Server` field so `Shutdown` can reach the underlying server; `ListenAndServe` is updated to store the server into that field before calling the blocking `srv.ListenAndServe()`. Closing a server that was never started is a no-op (`httpSrv == nil` short-circuit). `http.ErrServerClosed` is the expected return value from `ListenAndServe` after `Shutdown` and is explicitly not forwarded to `errCh`; this mirrors the existing pattern.
 
 `cmd/middleman/main.go`'s `run` function is reduced to loading config, constructing the GitHub client, setting up signal-cancellation, and calling `Run`. It does not reference `app.Syncer` or `app.Server` directly; the `Run` helper sequences them.
 
-To prevent a future edit from reintroducing the bypass (calling `Bootstrap` and then wiring `syncer.Start` / `ListenAndServe` inline in `main.go`), add a small AST-based regression test at `cmd/middleman/main_ast_test.go`:
+To prevent a future edit from reintroducing the bypass (calling `Bootstrap` and then wiring `syncer.Start` / `ListenAndServe` inline in `main.go`, or in any other file added to `cmd/middleman`), add a type-aware regression test at `cmd/middleman/main_ast_test.go` that inspects the **entire `cmd/middleman` package**, not just `main.go`:
 
 ```go
-// TestMainUsesAppRun parses main.go and asserts that run() calls app.Run
-// and does NOT directly call Syncer.Start or Server.ListenAndServe on
-// the *App returned by Bootstrap. This locks in the prime-before-start
-// ordering even if a future edit rearranges main.go.
-func TestMainUsesAppRun(t *testing.T) {
-    fset := token.NewFileSet()
-    file, err := parser.ParseFile(fset, "main.go", nil, 0)
-    // ... walk AST, collect all SelectorExpr with Sel.Name in
-    // {"Start", "ListenAndServe"}, fail if any target an *App field ...
+// TestOnlyAppRunStartsServerAndSyncer loads cmd/middleman with
+// go/packages (with type info) and walks every CallExpr in every
+// non-test source file. For each call, it resolves the callee via
+// types.Info. The test fails if any file OTHER THAN app.go calls:
+//   - (*github.com/wesm/middleman/internal/github.Syncer).Start
+//   - (*github.com/wesm/middleman/internal/server.Server).ListenAndServe
+//   - (*github.com/wesm/middleman/internal/server.Server).Shutdown
+// Only app.go (which contains Run and Bootstrap) is permitted to
+// reference these methods. main.go must go through Run, and any new
+// helper file added under cmd/middleman must also go through Run.
+func TestOnlyAppRunStartsServerAndSyncer(t *testing.T) {
+    cfg := &packages.Config{
+        Mode: packages.NeedName | packages.NeedFiles |
+              packages.NeedSyntax | packages.NeedTypes |
+              packages.NeedTypesInfo,
+        Dir:  ".",
+    }
+    pkgs, err := packages.Load(cfg, ".")
+    // ... for each syntax file in pkgs[0], skip test files and
+    // app.go itself, walk the AST, and for each *ast.CallExpr use
+    // pkg.TypesInfo.Uses[sel.Sel] to resolve the called method.
+    // Fail if the method's Pkg path + Name is in the forbidden set.
 }
 ```
 
-The test walks main.go's AST and fails the build if it finds a `SelectorExpr` like `app.Syncer.Start`, `app.Server.ListenAndServe`, or equivalents. Combined with the Bootstrap regression test, this gives two independent guardrails: `app_test.go` verifies the helper correctly orders prime and start, and `main_ast_test.go` verifies main.go actually uses the helper.
+The type-aware resolution closes the hole that a name-only match would leave open: it fails only on the actual `*Syncer.Start` / `*Server.ListenAndServe` / `*Server.Shutdown` method references, not on any unrelated method with the same selector name. It also catches any **new** file added to `cmd/middleman` that tries to wire startup inline instead of calling `Run`. Combined with the Bootstrap regression test, this gives two independent guardrails: `app_test.go` verifies the helper correctly orders prime and start, and `main_ast_test.go` verifies every file in `cmd/middleman` outside `app.go` goes through the helper.
 
 ### Event Types
 
@@ -459,7 +490,7 @@ When SSE is connected:
 - SSE endpoint: returns `text/event-stream` content type, receives events after broadcast, connection closes cleanly on client disconnect
 - SSE endpoint sends initial `sync_status` event: server startup primes the hub via `Broadcast(sync_status)` from `Syncer.Status()`; a new subscription's very first received event is a `sync_status` frame with that snapshot, flushed to the client before any transition-driven broadcast
 - SSE endpoint mid-sync connect: prime the hub, simulate a sync start broadcast T1, simulate a mid-sync progress broadcast T2, then open a new subscription. The first frame the client receives is T2 (the most recent), and the client never receives T1 or any older snapshot afterward. Regression guard for the "subscribe then queued older event" race.
-- SSE endpoint startup with in-progress sync (regression for priming race): this is guarded by **two independent tests**. (1) `cmd/middleman/app_test.go` drives the production `Bootstrap(cfg, configPath, mockClient)` helper with a mock GitHub client whose first list call blocks on a channel so a `RunOnce` can be stopped mid-cycle. After `Bootstrap` returns, the test calls `app.Syncer.Start(ctx)`, lets `RunOnce` broadcast its initial `Running: true` state to the callback, then opens a new SSE subscription through `app.Server`. The first frame the client receives is `{running: true}` (the most recent cached broadcast), not the zero-value snapshot used during priming. (2) `cmd/middleman/main_ast_test.go` parses `main.go` with `go/parser` and walks the AST to enforce that `main.go` does not reference `Syncer.Start` or `Server.ListenAndServe` anywhere — the helper test alone cannot prevent `main.go` from bypassing `Run` by calling `Bootstrap` and then wiring the startup inline, so the AST test closes that hole. Together: `app_test.go` verifies the helper's ordering is correct, and `main_ast_test.go` verifies `main.go` actually uses the helper.
+- SSE endpoint startup with in-progress sync (regression for priming race): this is guarded by **two independent tests**. (1) `cmd/middleman/app_test.go` drives the production `Bootstrap(cfg, configPath, mockClient)` helper with a mock GitHub client whose first list call blocks on a channel so a `RunOnce` can be stopped mid-cycle. After `Bootstrap` returns, the test calls `app.Syncer.Start(ctx)`, lets `RunOnce` broadcast its initial `Running: true` state to the callback, then opens a new SSE subscription through `app.Server`. The first frame the client receives is `{running: true}` (the most recent cached broadcast), not the zero-value snapshot used during priming. (2) `cmd/middleman/main_ast_test.go` loads the entire `cmd/middleman` package with `go/packages` (including type info), walks every CallExpr in every non-test file other than `app.go`, and fails if any resolves to `(*Syncer).Start`, `(*Server).ListenAndServe`, or `(*Server).Shutdown`. The helper test alone cannot prevent a future edit from bypassing `Run` by calling `Bootstrap` and then wiring the startup inline in `main.go` or in a new sibling file under `cmd/middleman`, so the AST test closes that hole. Together: `app_test.go` verifies the helper's ordering is correct, and `main_ast_test.go` verifies every entry point in `cmd/middleman` actually uses the helper.
 - SSE handler flush-on-error: wrap an `httptest.ResponseRecorder` with a custom writer whose `FlushError() error` method (the Go 1.20+ hook used by `http.NewResponseController(w).Flush()`) succeeds for the first N calls and returns a synthetic error on a later call. Drive the handler so that the first `rc.Flush()` (header flush in step 2) and the cached initial `sync_status` flush in the first select-loop iteration both succeed, then trigger a broadcast that causes the NEXT flush (either an event flush from step 5 or a keepalive flush from the ticker) to fail. Verify the handler returns promptly on that later flush error rather than looping on stale state. This ensures implementations cannot ignore post-write flush failures and still pass the test.
 - Syncer with `onStatusChange`: callback fires for started/progress/complete transitions
 - Syncer with `IsNotModified`: verify PR processing is skipped on 304, CI refresh still runs with cached head SHAs, issue sync still runs on PR list 304
@@ -492,14 +523,14 @@ When SSE is connected:
 | `internal/github/etag_transport.go` | HTTP transport with ETag injection + `IsNotModified` helper |
 | `internal/github/etag_transport_test.go` | Transport unit tests |
 | `frontend/src/lib/stores/events.svelte.ts` | SSE client and connection management |
-| `cmd/middleman/app.go` | `App` struct, `Bootstrap(cfg, configPath, ghClient)` helper that creates syncer + constructs server (primes hub, wires callback) without starting the syncer or listening, and `Run(ctx, cfg, configPath, ghClient, addr)` helper that calls `Bootstrap` then `Syncer.Start` then `Server.ListenAndServe` in order. `Run` is the only entry point `main.go` uses; `Bootstrap` is exposed separately so tests can inspect hub state between construction and start. |
+| `cmd/middleman/app.go` | `App` struct, `Bootstrap(cfg, configPath, ghClient)` helper that creates syncer + constructs server (primes hub, wires callback) without starting the syncer or listening, and `Run(ctx, cfg, configPath, ghClient, addr)` helper that calls `Bootstrap`, starts the syncer, runs `Server.ListenAndServe` in a goroutine, and selects on `ctx.Done()` to invoke `Server.Shutdown` (5s deadline) or on a server-error channel. `Run` is the only entry point `main.go` uses; `Bootstrap` is exposed separately so tests can inspect hub state between construction and start. |
 | `cmd/middleman/app_test.go` | Startup-ordering integration tests that drive `Bootstrap` directly with a mock GitHub client that blocks mid-`RunOnce`, asserting the cached `lastSyncStatus` reflects the in-progress state for new subscribers. |
-| `cmd/middleman/main_ast_test.go` | AST-based regression test: parses `main.go` with `go/parser`, walks the AST, and fails the build if it finds any `SelectorExpr` referencing `Syncer.Start` or `Server.ListenAndServe`. This prevents a future edit from bypassing `Run` by calling `Bootstrap` and then wiring the startup inline. |
+| `cmd/middleman/main_ast_test.go` | Type-aware regression test using `go/packages`: loads the entire `cmd/middleman` package with type info, walks every `CallExpr` in every non-test file other than `app.go`, and fails the build if any resolves to `(*Syncer).Start`, `(*Server).ListenAndServe`, or `(*Server).Shutdown`. Prevents any file under `cmd/middleman` — current `main.go` or a future sibling helper — from bypassing `Run` by wiring the startup inline. |
 
 ### Modified Files
 | File | Change |
 |------|--------|
-| `internal/server/server.go` | Add `EventHub` field, register `GET /api/v1/events` handler using `http.NewResponseController(w)` for flushable writes, set `WriteTimeout: 0`, wire syncer callback via `SetOnStatusChange`, prime the hub with `Broadcast(sync_status)` from `syncer.Status()` during server construction |
+| `internal/server/server.go` | Add `EventHub` field, register `GET /api/v1/events` handler using `http.NewResponseController(w)` for flushable writes, set `WriteTimeout: 0`, wire syncer callback via `SetOnStatusChange`, prime the hub with `Broadcast(sync_status)` from `syncer.Status()` during server construction. Add `httpSrv *http.Server` field and `Shutdown(ctx context.Context) error` method so `Run` can gracefully stop the server on ctx cancellation; `ListenAndServe` now stores the `*http.Server` into `s.httpSrv` before calling its blocking `ListenAndServe()`. |
 | `cmd/middleman/main.go` | Replace inline wiring with a single call to `Run(ctx, cfg, configPath, ghClient, addr)`. `main.go` does not reference `app.Syncer` or `app.Server` directly — `Run` sequences `Bootstrap` → `Syncer.Start` → `Server.ListenAndServe`. Enforced by `main_ast_test.go`. |
 | `internal/github/client.go` | Wrap OAuth2 transport with `etagTransport` in `NewClient` |
 | `internal/github/sync.go` | Add `onStatusChange` callback + setter, `headSHAs` cache, `IsNotModified` checks at 2 call sites, `refreshCIForExistingPRs` helper, refactor `refreshCIStatus` to take `number int, headSHA string` instead of `*gh.PullRequest` |
