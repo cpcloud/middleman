@@ -51,7 +51,14 @@ Methods:
 
 **Ordering guarantee:** `Subscribe` and `Broadcast` share the same `mu`, so the channel observed by a new subscriber always begins with the cached `lastSyncStatus` (if any) followed strictly by events broadcast after `Subscribe` returned. A transition broadcast that lands between a naive snapshot read and a subscribe can never sneak in ahead of the initial event, so the client cannot regress from a newer snapshot to an older buffered transition.
 
-**Priming:** Broadcasting with no subscribers is cheap (the subscriber loop is empty) and still updates `lastSyncStatus`. The server primes the hub on startup before `ListenAndServe` by calling `hub.Broadcast(Event{Type: "sync_status", Data: syncer.Status()})` once, so the very first subscriber still receives a cached entry even if no sync has occurred yet.
+**Priming and startup order:** Broadcasting with no subscribers is cheap (the subscriber loop is empty) and still updates `lastSyncStatus`. Priming the hub on startup must happen **before** `syncer.Start(ctx)`, or a newer callback-driven broadcast from an already-running sync could be overwritten by a later prime reading an older `Syncer.Status()` value. The required ordering in `cmd/middleman/main.go` becomes:
+
+1. Create the syncer (`NewSyncer`) — not yet started, `Status()` returns the zero value.
+2. Construct the server (`server.NewWithConfig`) — this creates the `EventHub`, registers the `onStatusChange` callback on the syncer via `SetOnStatusChange`, and primes the hub with `Broadcast(Event{Type: "sync_status", Data: syncer.Status()})`. Because the syncer has not started yet, no callback broadcasts can race with this prime.
+3. Call `syncer.Start(ctx)` — from this point forward, any status change flows through the already-wired callback, and the hub's `lastSyncStatus` stays monotonically current under the broadcast mutex.
+4. Call `srv.ListenAndServe(addr)`.
+
+This ordering also guarantees that the first HTTP request on `/api/v1/events` cannot land before the prime, because the server isn't listening yet.
 
 ### Event Types
 
@@ -68,10 +75,10 @@ Note: `data_changed` fires after every sync completion, even when ETags caused a
 
 Handler:
 1. Set headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`
-2. Assert `http.Flusher` interface, flush headers immediately
-3. Subscribe to hub with `r.Context()`. Because the hub pre-loads the cached `lastSyncStatus` into the new channel under the broadcast lock (see Event Hub), the very first receive from the channel in step 4's select loop is a `sync_status` event carrying the current state. The handler doesn't need to fetch `Syncer.Status()` separately, and there is no window between snapshot read and subscribe.
+2. Obtain an `*http.ResponseController` via `http.NewResponseController(w)`. This exposes a `Flush() error` method (unlike the bare `http.Flusher` interface, whose `Flush()` returns no error), so the handler can detect flush failures and return promptly. Call `rc.Flush()` to push headers; if it returns an error, return immediately (flushing unsupported or the underlying writer is broken).
+3. Subscribe to hub with `r.Context()`. Because the hub pre-loads the cached `lastSyncStatus` into the new channel under the broadcast lock (see Event Hub), the very first receive from the channel in step 5's select loop is a `sync_status` event carrying the current state. The handler doesn't need to fetch `Syncer.Status()` separately, and there is no window between snapshot read and subscribe.
 4. Start a 30s keepalive ticker
-5. Select loop: on channel event, marshal to SSE wire format (`event: <type>\ndata: <json>\n\n`), write, flush. If write or flush fails, return immediately (client disconnected). On ticker, write SSE comment (`: keepalive\n\n`), flush, return on failure. On context cancel, return. The very first iteration of this loop will drain the cached `sync_status` from the channel and flush it out, so the client receives the current state immediately after the headers — no separate "write then flush" step outside the loop is required.
+5. Select loop: on channel event, marshal to SSE wire format (`event: <type>\ndata: <json>\n\n`), write, call `rc.Flush()`. If `Write` returns an error or `rc.Flush()` returns an error, return immediately (client disconnected or flush failed). On ticker, write SSE comment (`: keepalive\n\n`), call `rc.Flush()`, return on write or flush failure. On context cancel, return. The very first iteration of this loop will drain the cached `sync_status` from the channel and flush it out, so the client receives the current state immediately after the headers — no separate "write then flush" step outside the loop is required.
 6. Keepalive ticker is stopped via defer
 
 SSE is exempt from CSRF checks (GET request -- the existing CSRF check in `ServeHTTP` only applies to non-GET methods).
@@ -397,7 +404,8 @@ When SSE is connected:
 - SSE endpoint: returns `text/event-stream` content type, receives events after broadcast, connection closes cleanly on client disconnect
 - SSE endpoint sends initial `sync_status` event: server startup primes the hub via `Broadcast(sync_status)` from `Syncer.Status()`; a new subscription's very first received event is a `sync_status` frame with that snapshot, flushed to the client before any transition-driven broadcast
 - SSE endpoint mid-sync connect: prime the hub, simulate a sync start broadcast T1, simulate a mid-sync progress broadcast T2, then open a new subscription. The first frame the client receives is T2 (the most recent), and the client never receives T1 or any older snapshot afterward. Regression guard for the "subscribe then queued older event" race.
-- SSE handler flush-on-error: mock a `ResponseWriter` whose first `Flush()` (covering the cached initial frame) returns an error; handler returns promptly rather than looping on stale state.
+- SSE endpoint startup with in-progress sync (regression for priming race): use a mock GitHub client whose first list call blocks on a channel so a `RunOnce` can be stopped mid-cycle. Construct the syncer and server in the prescribed order (server BEFORE `syncer.Start`), then start the syncer. Let `RunOnce` broadcast its initial `Running: true` state to the callback, then open a new SSE subscription. The first frame the client receives is `{running: true}` (the most recent cached broadcast), not the zero-value snapshot used during priming. This confirms that callback broadcasts after `syncer.Start` correctly overwrite the earlier prime and that the prescribed ordering (prime before start) prevents a later prime from clobbering a newer broadcast.
+- SSE handler flush-on-error: wrap an `httptest.ResponseRecorder` with a custom writer whose `FlushError() error` method (the Go 1.20+ hook used by `http.NewResponseController(w).Flush()`) returns a synthetic error on the first invocation. Verify the handler returns promptly on the failing flush rather than looping on stale state.
 - Syncer with `onStatusChange`: callback fires for started/progress/complete transitions
 - Syncer with `IsNotModified`: verify PR processing is skipped on 304, CI refresh still runs with cached head SHAs, issue sync still runs on PR list 304
 
@@ -433,7 +441,8 @@ When SSE is connected:
 ### Modified Files
 | File | Change |
 |------|--------|
-| `internal/server/server.go` | Add `EventHub` field, register `GET /api/v1/events` handler, set `WriteTimeout: 0`, wire syncer callback via `SetOnStatusChange`, prime the hub with `Broadcast(sync_status)` from `syncer.Status()` before `ListenAndServe` |
+| `internal/server/server.go` | Add `EventHub` field, register `GET /api/v1/events` handler using `http.NewResponseController(w)` for flushable writes, set `WriteTimeout: 0`, wire syncer callback via `SetOnStatusChange`, prime the hub with `Broadcast(sync_status)` from `syncer.Status()` during server construction |
+| `cmd/middleman/main.go` | Reorder startup so `server.NewWithConfig(...)` (which primes the hub and registers the callback) is called BEFORE `syncer.Start(ctx)`. Current order is syncer-start-then-server; new order is server-then-syncer-start-then-ListenAndServe. Prevents a later prime from clobbering a newer callback broadcast. |
 | `internal/github/client.go` | Wrap OAuth2 transport with `etagTransport` in `NewClient` |
 | `internal/github/sync.go` | Add `onStatusChange` callback + setter, `headSHAs` cache, `IsNotModified` checks at 2 call sites, `refreshCIForExistingPRs` helper, refactor `refreshCIStatus` to take `number int, headSHA string` instead of `*gh.PullRequest` |
 | `frontend/src/lib/stores/sync.svelte.ts` | Add `updateSyncFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
