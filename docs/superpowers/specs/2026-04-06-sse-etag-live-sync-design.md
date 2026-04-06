@@ -306,13 +306,13 @@ The events store imports `getPage()` from the router store to determine which vi
 **Prerequisite: move component-level polling into stores.** Currently, `PullList.svelte`, `IssueList.svelte`, and `KanbanBoard.svelte` each have their own 15s `setInterval` timers that call `loadPulls()`/`loadIssues()` directly. These must be moved into their respective stores so the SSE events store can centrally control them. Without this, SSE would disable store-level polling but component-level timers would keep firing.
 
 **`pulls.svelte.ts`:**
-- New `startListPolling(overrides?)` / `stopListPolling()` functions managing a 15s timer that calls `loadPulls(overrides)`. The optional `overrides` parameter lets callers lock the timer to specific filters (e.g., `{ state: "open" }` for the board view). `startListPolling` stores the active overrides in module-level state. `stopListPolling` clears both the interval AND the stored overrides (component unmount — timer should not revive). Replaces the `setInterval` in `PullList.svelte` and `KanbanBoard.svelte`.
-- New `enablePolling()` / `disablePolling()` to gate polling on SSE connection state. These are distinct from start/stop: `disablePolling` clears the interval but preserves the stored overrides. `enablePolling` recreates the timer with the previously-stored overrides (so board polling restarts with `{ state: "open" }` after SSE reconnect). If no overrides are stored (component already unmounted via `stopListPolling`), `enablePolling` is a no-op for the list timer.
+- New `startListPolling(overrides?)` / `stopListPolling()` functions managing a 15s timer that calls `loadPulls(overrides)`. The optional `overrides` parameter lets callers lock the timer to specific filters (e.g., `{ state: "open" }` for the board view). `startListPolling` stores the active overrides AND sets a boolean `listPollingActive` flag to true. `stopListPolling` clears the interval, the stored overrides, AND sets the flag to false (component unmount — timer should not revive). Replaces the `setInterval` in `PullList.svelte` and `KanbanBoard.svelte`.
+- New `enablePolling()` / `disablePolling()` to gate polling on SSE connection state. These are distinct from start/stop: `disablePolling` clears the interval but preserves both the stored overrides and the `listPollingActive` flag. `enablePolling` checks the flag — if true, recreates the timer with the stored overrides (so board polling restarts with `{ state: "open" }`, and plain sidebar polling restarts with no overrides). If false (component unmounted via `stopListPolling`), `enablePolling` is a no-op for the list timer.
 - Events store calls `loadPulls()` on `data_changed`.
 
 **`issues.svelte.ts`:**
-- New `startListPolling()` / `stopListPolling()` functions managing a 15s timer that calls `loadIssues()`. Replaces the `setInterval` in `IssueList.svelte`.
-- New `enablePolling()` / `disablePolling()` with same pattern.
+- New `startListPolling()` / `stopListPolling()` functions managing a 15s timer that calls `loadIssues()`. Same `listPollingActive` flag pattern as pulls store. Replaces the `setInterval` in `IssueList.svelte`.
+- Existing `startIssueDetailPolling` / `stopIssueDetailPolling` gain the same lifecycle/toggle semantics as `detail.svelte.ts`: `startIssueDetailPolling` stores the current target (owner/name/number) and sets `issueDetailActive` flag. `stopIssueDetailPolling` clears the interval, stored target, and flag. `enablePolling` / `disablePolling` check the flag — `disablePolling` preserves target, `enablePolling` recreates the timer if the flag is true. This ensures issue detail polling restarts correctly after SSE reconnect (for both the issues page and the activity drawer's issue items).
 - New `refreshFromSSE(owner: string, name: string, number: number)` that calls the existing issue detail refresh.
 - Events store calls `loadIssues()` on `data_changed` when issues page is active.
 
@@ -389,7 +389,9 @@ When SSE is connected:
 
 - Events store: `connect()` creates EventSource with correct URL, `disconnect()` closes it
 - Polling toggle: `disablePolling()` clears timers, `enablePolling()` restarts them with preserved config
-- Lifecycle vs toggle: `stopListPolling()` then `enablePolling()` does NOT revive list timer (overrides cleared on stop). Same for `stopDetailPolling()` then `enablePolling()` (target cleared on stop)
+- Lifecycle vs toggle: `stopListPolling()` then `enablePolling()` does NOT revive list timer (flag cleared on stop). Same for `stopDetailPolling()` / `stopIssueDetailPolling()` then `enablePolling()`
+- Plain `startListPolling()` (no overrides) survives `disablePolling()` / `enablePolling()` cycle — timer restarts because `listPollingActive` flag is true even though overrides are undefined
+- Issue detail polling: `startIssueDetailPolling` through disable/enable preserves target, `stopIssueDetailPolling` then `enablePolling` does not revive
 - `updateSyncFromSSE` updates state and fires completion callback
 - View-aware refresh: `data_changed` triggers correct store functions based on current page
 
