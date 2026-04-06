@@ -110,14 +110,14 @@ This is safe because the server only listens on loopback (127.0.0.1). `ReadTimeo
 
 ### Target Endpoints
 
-Four endpoints benefit from ETags (the only ones called unconditionally every sync cycle):
+Two list endpoints benefit from ETags:
 
 | Endpoint | Calls per cycle | ETag benefit |
 |----------|----------------|-------------|
 | `ListOpenPullRequests` | 1 per repo | Skip entire PR list processing when no PRs changed |
 | `ListOpenIssues` | 1 per repo | Skip entire issue list processing when no issues changed |
-| `GetCombinedStatus` | 1 per open PR | Skip CI status write when status unchanged for this SHA |
-| `ListCheckRunsForRef` | 1 per open PR | Skip check runs write when runs unchanged for this SHA |
+
+`GetCombinedStatus` and `ListCheckRunsForRef` are excluded from ETag support. While they run unconditionally every cycle, their normalization functions (`NormalizeCIStatus`, `NormalizeCIChecks`) merge data from both sources into a single `ci_checks_json` column. Partial updates (one endpoint returns 304, the other returns 200) would require parsing and merging the existing JSON blob, adding complexity that outweighs the rate limit savings from these single-request endpoints.
 
 All other read endpoints are already conditionally called (guarded by `UpdatedAt` comparison or in-memory caches).
 
@@ -137,11 +137,14 @@ type etagEntry struct {
 ```
 
 `RoundTrip(req)`:
-1. Look up `req.URL.String()` in cache. If found, clone the request and add `If-None-Match: <etag>` header (must clone to avoid mutating the original).
-2. Call `base.RoundTrip(req)` with the (possibly modified) request.
-3. On 200: store the response `ETag` header value in cache (if present). Return response.
-4. On 304: return response as-is (empty body, 304 status).
-5. On other status: return response as-is.
+1. Check if this is a paginated later-page request: if the URL has a `page` query parameter with value > 1, skip ETag handling entirely — pass through to the base transport.
+2. Look up `req.URL.String()` in cache. If found, clone the request and add `If-None-Match: <etag>` header (must clone to avoid mutating the original).
+3. Call `base.RoundTrip(req)` with the (possibly modified) request.
+4. On 200: store the response `ETag` header value in cache (if present). Return response.
+5. On 304: return response as-is (empty body, 304 status).
+6. On other status: return response as-is.
+
+The page-check in step 1 prevents a correctness bug with paginated endpoints: go-github's first page request has no `page` parameter, while subsequent pages have `page=2`, `page=3`, etc. Without this check, a cached ETag for page 2 could cause a 304 on a subsequent cycle even when page 1 returned 200 (indicating changes), causing `collectPages` to abort and discard real page-1 data.
 
 ### Not-Modified Detection
 
@@ -182,7 +185,7 @@ type Syncer struct {
 
 Populated during normal sync (when `ListOpenPullRequests` returns 200). On each 200 response, replace the entire inner map for this repoID with only the PRs from the current response -- this automatically evicts entries for closed/merged PRs that no longer appear in the open list. Lost on process restart, but so is the ETag cache, so the first sync always does a full fetch.
 
-#### Four call sites with IsNotModified handling
+#### Two call sites with IsNotModified handling
 
 **1. `doSyncRepo` -- ListOpenPullRequests:**
 
@@ -207,7 +210,7 @@ if IsNotModified(err) {
 if err := s.syncIssues(ctx, repo, repoID); err != nil { ... }
 ```
 
-New helper `refreshCIForExistingPRs`: reads the head SHA cache for this repoID, calls `refreshCIStatus` for each entry. If the cache is empty (first sync after restart), returns nil (the 304 won't happen anyway since there's no cached ETag on first sync).
+New helper `refreshCIForExistingPRs`: reads the head SHA cache for this repoID, calls `refreshCIStatus` for each entry (which still fetches CI data from the GitHub API unconditionally -- no ETags on CI endpoints). If the cache is empty (first sync after restart), returns nil (the 304 won't happen anyway since there's no cached ETag on first sync).
 
 On normal 200 response, replace the headSHAs entry for this repoID with only the current open PRs' head SHAs.
 
@@ -224,71 +227,19 @@ if err != nil {
 
 Issues have no independent background updates (unlike CI), so 304 means skip entirely.
 
-**3. `refreshCIStatus` -- GetCombinedStatus:**
-```go
-combined, err := s.client.GetCombinedStatus(ctx, repo.Owner, repo.Name, headSHA)
-if IsNotModified(err) {
-    combined = nil // mark as unchanged
-    err = nil
-}
-if err != nil {
-    slog.Warn("get combined status failed", ...)
-    return nil
-}
-```
-
-**4. `refreshCIStatus` -- ListCheckRunsForRef:**
-```go
-checkRuns, err := s.client.ListCheckRunsForRef(ctx, repo.Owner, repo.Name, headSHA)
-if IsNotModified(err) {
-    checkRuns = nil // mark as unchanged
-    err = nil
-}
-if err != nil {
-    slog.Warn("list check runs failed", ...)
-    return nil
-}
-
-// Only update DB if at least one source returned new data
-if combined == nil && checkRuns == nil {
-    return nil // both unchanged, skip DB write entirely
-}
-```
-
-**Partial update when one source is 304:**
-
-When one source returns 304 and the other returns 200, we need a partial DB update. The normalization functions (`NormalizeCIStatus`, `NormalizeCIChecks`) require their respective non-nil inputs, so we cannot normalize 304 sources.
-
-Approach: read the existing `ci_status` and `ci_checks_json` from the DB row. For the 200 source, normalize and use the new value. For the 304 source, keep the existing DB value. Write the merged result back.
-
-```go
-existingStatus, existingChecks := s.db.GetPRCIFields(ctx, repoID, number)
-ciStatus := existingStatus
-ciChecksJSON := existingChecks
-if combined != nil {
-    ciStatus = NormalizeCIStatus(combined)
-}
-if checkRuns != nil {
-    ciChecksJSON = NormalizeCIChecks(checkRuns, combined)
-}
-return s.db.UpdatePRCIStatus(ctx, repoID, number, ciStatus, ciChecksJSON)
-```
-
-Note: `NormalizeCIChecks(checkRuns, combined)` uses `combined` for commit status entries. When combined is nil (304), call `NormalizeCIChecks(checkRuns, nil)` — the function should handle nil combined by omitting commit status entries (they haven't changed and are already stored in the DB from a prior sync). This requires a small adjustment to `NormalizeCIChecks` to treat nil combined as "no commit statuses to add."
-
 ### Pagination and ETags
 
-`ListOpenPullRequests` and `ListOpenIssues` use `collectPages`. The ETag transport caches per-URL, so each page gets its own ETag.
+`ListOpenPullRequests` and `ListOpenIssues` use `collectPages`. The ETag transport only caches ETags for first-page requests (URLs without a `page` query parameter). Later pages (`page=2`, `page=3`, etc.) bypass ETag handling entirely and always fetch fresh data.
 
-When page 1 returns 304 (via `collectPages` returning the not-modified error from go-github), the caller treats the entire list as unchanged. When page 1 returns 200, all pages are fetched normally.
+This design prevents a correctness bug: if page 1 returns 200 (data changed) but page 2 had a stale cached ETag and returned 304, `collectPages` would abort with a not-modified error, discarding the real page-1 changes.
 
-**Known limitation for multi-page results:** `ListOpenPullRequests` sorts by creation date (GitHub default). If a PR beyond page 1 is updated (e.g., gets a new comment), page 1's content and ETag may not change, causing the update to be missed for one sync cycle. This is acceptable for middleman's target use case (small repo set -- most repos have <100 open PRs, fitting in a single page). `ListOpenIssues` sorts by `updated_at DESC`, so the most recently updated issue always appears on page 1 and this limitation does not apply.
+When the first page returns 304, `collectPages` returns the not-modified error immediately. The caller treats the entire list as unchanged and skips processing.
+
+**Known limitation for multi-page results:** `ListOpenPullRequests` sorts by creation date (GitHub default). A 304 on page 1 only proves page 1's content is unchanged. If a PR beyond page 1 is updated (e.g., gets a new comment), page 1's ETag may not change, causing the update to be missed for one sync cycle. This is acceptable for middleman's target use case (small repo set -- most repos have <100 open PRs, fitting in a single page). `ListOpenIssues` sorts by `updated_at DESC`, so the most recently updated issue always appears on page 1 and this limitation does not apply.
 
 ### ETag Cache Lifetime
 
-The `sync.Map` lives on the transport for the process lifetime. Entries are keyed by full URL (including query params). Cache size is bounded by the number of unique URLs hit: (repos * 2 list endpoints) + (open PRs * 2 CI endpoints). For a typical setup (5 repos, 20 open PRs each), this is ~210 entries.
-
-Stale entries (e.g., CI status URLs for merged PRs) are harmless -- tiny memory, never matched again. No eviction needed.
+The `sync.Map` lives on the transport for the process lifetime. Entries are keyed by full URL (including query params). Only first-page URLs are cached (later pages are excluded), so cache size is bounded by repos * 2 list endpoints. For a typical setup (5 repos), this is 10 entries. No eviction needed.
 
 ---
 
@@ -333,6 +284,19 @@ The events store imports `getPage()` from the router store to determine which vi
 
 ### Store Changes
 
+**Prerequisite: move component-level polling into stores.** Currently, `PullList.svelte`, `IssueList.svelte`, and `KanbanBoard.svelte` each have their own 15s `setInterval` timers that call `loadPulls()`/`loadIssues()` directly. These must be moved into their respective stores so the SSE events store can centrally control them. Without this, SSE would disable store-level polling but component-level timers would keep firing.
+
+**`pulls.svelte.ts`:**
+- New `startListPolling()` / `stopListPolling()` functions managing a 15s timer that calls `loadPulls()`. Replaces the `setInterval` in `PullList.svelte` and `KanbanBoard.svelte`.
+- New `enablePolling()` / `disablePolling()` to gate polling on SSE connection state. `startListPolling` checks the `pollingEnabled` flag before creating the timer.
+- Events store calls `loadPulls()` on `data_changed`.
+
+**`issues.svelte.ts`:**
+- New `startListPolling()` / `stopListPolling()` functions managing a 15s timer that calls `loadIssues()`. Replaces the `setInterval` in `IssueList.svelte`.
+- New `enablePolling()` / `disablePolling()` with same pattern.
+- New `refreshFromSSE(owner: string, name: string, number: number)` that calls the existing issue detail refresh.
+- Events store calls `loadIssues()` on `data_changed` when issues page is active.
+
 **`sync.svelte.ts`:**
 - New `updateSyncFromSSE(status: SyncStatus)` function: sets state directly and fires `onSyncComplete` callback when detecting running-to-idle transition. Same logic as `refreshSyncStatus` but without the HTTP call.
 - New `enablePolling()` / `disablePolling()` functions. `disablePolling` clears the interval. `enablePolling` restarts it at the current interval. `startPolling` and `stopPolling` still exist for lifecycle (mount/unmount) but check a `pollingEnabled` flag before creating timers.
@@ -344,15 +308,6 @@ The events store imports `getPage()` from the router store to determine which vi
 **`detail.svelte.ts`:**
 - New `enablePolling()` / `disablePolling()` functions with same pattern.
 - New `refreshFromSSE(owner: string, name: string, number: number)` that calls the existing `refreshDetail()`.
-
-**`issues.svelte.ts`:**
-- New `enablePolling()` / `disablePolling()` functions with same pattern (for issue detail polling).
-- New `refreshFromSSE(owner: string, name: string, number: number)` that calls the existing issue detail refresh.
-- Events store calls `loadIssues()` on `data_changed` when issues page is active.
-
-**`pulls.svelte.ts`:**
-- No polling to disable (already on-demand).
-- Events store calls `loadPulls()` directly.
 
 ### Connection Lifecycle
 
@@ -399,12 +354,13 @@ When SSE is connected:
 - 304 response returned as-is (status preserved)
 - Different URLs get independent ETag entries
 - Request without cached ETag has no `If-None-Match` header
+- Requests with `page` query parameter > 1 bypass ETag handling (no `If-None-Match` sent, no ETag stored)
 - `IsNotModified` returns true for 304 errors, false for other errors
 
 **Integration tests:**
 - SSE endpoint: returns `text/event-stream` content type, receives events after broadcast, connection closes cleanly on client disconnect
 - Syncer with `onStatusChange`: callback fires for started/progress/complete transitions
-- Syncer with `IsNotModified`: verify PR processing is skipped on 304, CI refresh still runs with cached head SHAs
+- Syncer with `IsNotModified`: verify PR processing is skipped on 304, CI refresh still runs with cached head SHAs, issue sync still runs on PR list 304
 
 ### Frontend Tests
 
@@ -431,12 +387,13 @@ When SSE is connected:
 |------|--------|
 | `internal/server/server.go` | Add `EventHub` field, register `GET /api/v1/events` handler, set `WriteTimeout: 0`, wire syncer callback via `SetOnStatusChange` |
 | `internal/github/client.go` | Wrap OAuth2 transport with `etagTransport` in `NewClient` |
-| `internal/github/sync.go` | Add `onStatusChange` callback + setter, `headSHAs` cache, `IsNotModified` checks at 4 call sites, `refreshCIForExistingPRs` helper, refactor `refreshCIStatus` to take `number int, headSHA string` instead of `*gh.PullRequest` |
-| `internal/github/normalize.go` | Handle nil `combined` parameter in `NormalizeCIChecks` (skip commit status entries when nil) |
-| `internal/db/queries.go` | Add `GetPRCIFields(ctx, repoID, number)` query for partial CI update reads |
+| `internal/github/sync.go` | Add `onStatusChange` callback + setter, `headSHAs` cache, `IsNotModified` checks at 2 call sites, `refreshCIForExistingPRs` helper, refactor `refreshCIStatus` to take `number int, headSHA string` instead of `*gh.PullRequest` |
 | `frontend/src/lib/stores/sync.svelte.ts` | Add `updateSyncFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
 | `frontend/src/lib/stores/activity.svelte.ts` | Add `refreshFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
 | `frontend/src/lib/stores/detail.svelte.ts` | Add `refreshFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
 | `frontend/src/lib/stores/issues.svelte.ts` | Add `refreshFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
-| `frontend/src/lib/stores/pulls.svelte.ts` | No structural changes (events store calls `loadPulls` directly) |
+| `frontend/src/lib/stores/pulls.svelte.ts` | Add `startListPolling`/`stopListPolling`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
+| `frontend/src/lib/components/sidebar/PullList.svelte` | Remove 15s `setInterval`, call `startListPolling`/`stopListPolling` from pulls store |
+| `frontend/src/lib/components/sidebar/IssueList.svelte` | Remove 15s `setInterval`, call `startListPolling`/`stopListPolling` from issues store |
+| `frontend/src/lib/components/kanban/KanbanBoard.svelte` | Remove 15s `setInterval`, call `startListPolling`/`stopListPolling` from pulls store |
 | `frontend/src/App.svelte` | Call `connect()` on mount, `disconnect()` on destroy |
