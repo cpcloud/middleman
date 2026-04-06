@@ -319,7 +319,7 @@ The events store imports `getPage()` from the router store to determine which vi
 - Events store calls `loadIssues()` on `data_changed` when issues page is active.
 
 **`sync.svelte.ts`:**
-- New `updateSyncFromSSE(status: SyncStatus)` function: sets state directly and fires `onSyncComplete` callback when detecting running-to-idle transition. Same logic as `refreshSyncStatus` but without the HTTP call.
+- New `updateSyncFromSSE(status: SyncStatus)` function: sets state directly, fires `onSyncComplete` callback when detecting running-to-idle transition, AND runs the same `adjustPollingSpeed` logic as `refreshSyncStatus` to update `currentIntervalMs` (2s while running, 30s idle). This ensures `currentIntervalMs` tracks SSE-delivered transitions so that when SSE later disconnects, `enablePolling` recreates the timer at the correct adaptive cadence. Same as `refreshSyncStatus` but without the HTTP call.
 - New `enablePolling()` / `disablePolling()` functions following the polling gate rule. `disablePolling` clears the interval but preserves the current `currentIntervalMs` (the adaptive 2s-while-syncing or 30s-idle value). `enablePolling` recreates the timer at the preserved `currentIntervalMs` so a sync that was running during SSE disconnect resumes at 2s, not the 30s default.
 - `startPolling` and `stopPolling` still exist for lifecycle (mount/unmount). `startPolling` records the `syncPollingActive` flag but checks `pollingEnabled` before creating the timer. When `pollingEnabled` is false, `startPolling` must NOT touch `currentIntervalMs` — the preserved adaptive value must survive mount-during-SSE. When `pollingEnabled` is true, `startPolling` uses `currentIntervalMs` (defaulting it only if unset). `stopPolling` clears the interval, the flag, and resets `currentIntervalMs` to the default.
 
@@ -398,6 +398,8 @@ When SSE is connected:
 - Mount while SSE connected: after `disablePolling()`, calling `startListPolling()` / `startDetailPolling()` / `startIssueDetailPolling()` / `startActivityPolling()` / sync store `startPolling()` records active state but does NOT create a timer. Subsequent `enablePolling()` creates the timer from the recorded state
 - Sync interval preservation through mount: sync is running at 2s, SSE connects (`disablePolling()` preserves `currentIntervalMs: 2s`), sync store `startPolling()` is called from a newly-mounted view (must NOT clobber `currentIntervalMs` back to 30s), then SSE errors (`enablePolling()` recreates the timer at 2s, not 30s)
 - `updateSyncFromSSE` updates state and fires completion callback
+- `updateSyncFromSSE` idle-to-running transition: `pollingEnabled = false` (SSE connected), `currentIntervalMs = 30000`, SSE delivers `{ running: true }` → `currentIntervalMs` updates to 2000. Calling `enablePolling()` after this creates the fallback timer at 2000ms, not 30000ms
+- `updateSyncFromSSE` running-to-idle transition: `pollingEnabled = false`, `currentIntervalMs = 2000`, SSE delivers `{ running: false }` → `currentIntervalMs` updates to 30000 AND `onSyncComplete` callback fires. Calling `enablePolling()` after this creates the fallback timer at 30000ms
 - View-aware refresh: `data_changed` triggers correct store functions based on current page
 
 ---
