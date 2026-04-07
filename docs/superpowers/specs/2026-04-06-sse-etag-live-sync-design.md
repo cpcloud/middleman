@@ -47,7 +47,7 @@ type EventHub struct {
 
 Methods:
 - `Subscribe(ctx context.Context) <-chan Event` -- under `mu`, creates a buffered channel (buffer size 16), pre-loads `lastSyncStatus` into the channel if non-nil, registers the channel, and releases the lock. Spawns a goroutine that removes the subscriber and closes the channel when ctx is canceled. Returns the channel.
-- `Broadcast(event Event)` -- under `mu`, updates `lastSyncStatus` if `event.Type == "sync_status"` (stored by value), then iterates subscribers with a non-blocking send to each channel. Drops events for slow consumers (full channel).
+- `Broadcast(event Event)` -- under `mu`, updates `lastSyncStatus` if `event.Type == "sync_status"` (stored by value), then iterates subscribers with a non-blocking send to each channel. **If a non-blocking send fails (channel full), the hub does NOT silently drop the event; it removes the subscriber from the map and closes the subscriber's channel.** This guarantees the SSE handler observes the closure (via the two-value receive specified below) and exits, the client's `EventSource` fires `onerror` and reconnects, and on reconnect the new subscription is pre-loaded with the current `lastSyncStatus` and resumes from a clean state. Coalescing inside a fixed buffer would require either an unbounded backlog or per-type slots; closing the slow subscriber is simpler and safe because (a) the cached `lastSyncStatus` is restored on reconnect, (b) the polling fallback in the frontend resumes during the brief disconnect window, and (c) `data_changed` is not lost — the very next `Broadcast` after reconnect that completes a sync still delivers it. Crucially, **terminal `data_changed` events cannot be silently dropped while the client remains connected**: a dropped event always causes a disconnect, never a silent loss.
 
 **Ordering guarantee:** `Subscribe` and `Broadcast` share the same `mu`, so the channel observed by a new subscriber always begins with the cached `lastSyncStatus` (if any) followed strictly by events broadcast after `Subscribe` returned. A transition broadcast that lands between a naive snapshot read and a subscribe can never sneak in ahead of the initial event, so the client cannot regress from a newer snapshot to an older buffered transition.
 
@@ -92,9 +92,25 @@ func Run(ctx context.Context, cfg *config.Config, configPath string, ghClient gh
     if err != nil {
         return err
     }
+    // Defer order matters: Go runs deferred calls LIFO. We want
+    // Syncer.Stop() (which now blocks until any in-flight RunOnce
+    // returns and the goroutine exits) to run BEFORE DB.Close(),
+    // otherwise a sync goroutine could still be touching the DB
+    // after Run unwinds — most visibly on the bind-error and
+    // server-error return paths, which would otherwise close the
+    // DB while a RunOnce kicked off by app.Syncer.Start was still
+    // mid-flight. Stop is registered LAST so it runs FIRST.
     defer app.DB.Close()
-    app.Syncer.Start(ctx)
-    defer app.Syncer.Stop()
+    // Use a dedicated cancel for the syncer so the deferred Stop
+    // can both signal the goroutine and wait for it to finish,
+    // independent of the parent ctx (which on the bind-error path
+    // is still alive when Run returns).
+    syncCtx, cancelSync := context.WithCancel(ctx)
+    app.Syncer.Start(syncCtx)
+    defer func() {
+        cancelSync()
+        app.Syncer.Stop() // blocks until the goroutine exits
+    }()
 
     // Synchronously bind the TCP listener and prepare *http.Server
     // BEFORE spawning the serve goroutine. A bind error here is
@@ -340,19 +356,20 @@ Handler:
 2. Obtain an `*http.ResponseController` via `http.NewResponseController(w)`. This exposes a `Flush() error` method (unlike the bare `http.Flusher` interface, whose `Flush()` returns no error), so the handler can detect flush failures and return promptly. Call `rc.Flush()` to push headers; if it returns an error, return immediately (flushing unsupported or the underlying writer is broken).
 3. Subscribe to hub with `r.Context()`. Because the hub pre-loads the cached `lastSyncStatus` into the new channel under the broadcast lock (see Event Hub), the very first receive from the channel in step 5's select loop is a `sync_status` event carrying the current state. The handler doesn't need to fetch `Syncer.Status()` separately, and there is no window between snapshot read and subscribe.
 4. Start a 30s keepalive ticker
-5. Select loop: on channel event, marshal to SSE wire format (`event: <type>\ndata: <json>\n\n`), write, call `rc.Flush()`. If `Write` returns an error or `rc.Flush()` returns an error, return immediately (client disconnected or flush failed). On ticker, write SSE comment (`: keepalive\n\n`), call `rc.Flush()`, return on write or flush failure. On context cancel, return. The very first iteration of this loop will drain the cached `sync_status` from the channel and flush it out, so the client receives the current state immediately after the headers — no separate "write then flush" step outside the loop is required.
+5. Select loop: on channel receive, use the **two-value form** `event, ok := <-ch` and return immediately when `ok` is false. The hub closes a subscriber's channel both when its context is canceled (the normal cleanup path) and when a non-blocking broadcast send finds the channel full (the slow-consumer path described in Event Hub). Treating both cases identically — exit the handler — ensures the loop never spins on a closed channel emitting zero-value `Event{}` frames as bogus empty SSE writes. When `ok` is true, marshal the event to SSE wire format (`event: <type>\ndata: <json>\n\n`), write, call `rc.Flush()`. If `Write` returns an error or `rc.Flush()` returns an error, return immediately (client disconnected or flush failed). On ticker, write SSE comment (`: keepalive\n\n`), call `rc.Flush()`, return on write or flush failure. On context cancel, return. The very first iteration of this loop will drain the cached `sync_status` from the channel and flush it out, so the client receives the current state immediately after the headers — no separate "write then flush" step outside the loop is required.
 6. Keepalive ticker is stopped via defer
 
 SSE is exempt from CSRF checks (GET request -- the existing CSRF check in `ServeHTTP` only applies to non-GET methods).
 
 ### Syncer Integration
 
-The Syncer gets a callback field:
+The Syncer gets a callback field and a waitable shutdown:
 
 ```go
 type Syncer struct {
     // ... existing fields ...
     onStatusChange func(*SyncStatus)
+    done           chan struct{} // closed by the goroutine on exit
 }
 ```
 
@@ -371,6 +388,23 @@ The callback fires at each `s.status.Store(...)` call site in `RunOnce`:
 1. `SyncStatus{Running: true}` -- sync started (broadcasts `sync_status`)
 2. `SyncStatus{Running: true, CurrentRepo: ..., Progress: ...}` -- per-repo progress (broadcasts `sync_status`)
 3. `SyncStatus{Running: false, LastRunAt: ..., LastError: ...}` -- sync complete (broadcasts `sync_status` + `data_changed`)
+
+#### Waitable shutdown
+
+`Syncer.Stop()` is changed from fire-and-forget (close `stopCh` and return immediately) to **waitable**: it closes `stopCh` and then blocks until the background goroutine has exited. This is required for safe DB-close ordering in `Run`.
+
+`NewSyncer` now also creates `s.done = make(chan struct{})`. The goroutine spawned by `Start` does `defer close(s.done)` as its very first deferred call, so `done` is closed only after both `RunOnce` (and any in-flight DB writes inside it) and the ticker loop have returned. `Stop()` is then:
+
+```go
+func (s *Syncer) Stop() {
+    s.stopOnce.Do(func() { close(s.stopCh) })
+    <-s.done
+}
+```
+
+The `sync.Once` guard makes `Stop` idempotent so a second call (e.g., test cleanup followed by `Run`'s deferred Stop) does not panic on double-close. `<-s.done` is safe to call multiple times.
+
+Important consequence for `RunOnce`'s context: closing `stopCh` is not enough on its own to interrupt a long-running HTTP request inside `RunOnce`, which observes only its own `ctx` parameter. `Run` therefore creates a dedicated `syncCtx, cancelSync := context.WithCancel(ctx)` and passes `syncCtx` to `Syncer.Start`, so the deferred `cancelSync()` (run before the deferred `Stop()`) cancels any in-flight HTTP call before `Stop` waits on `done`. Without this, `Stop` could block indefinitely on a stuck network request after a parent ctx that was never canceled (the bind-error and server-error paths return without canceling the parent).
 
 ### WriteTimeout
 
@@ -671,10 +705,16 @@ When SSE is connected:
 - `Run` bind-error propagation: the test creates an already-bound TCP listener on an ephemeral port, then calls `Run(ctx, cfg, cfgPath, mockClient, boundAddr)`. `Run` must return a wrapped bind error (the `"listen: …"` prefix from the synchronous `Server.Listen` call), not `nil`. Verifies that `Listen` actually calls `net.Listen` synchronously and that bind errors cannot be masked by a later `ctx.Done()`.
 - `Run` serve-error propagation after cancel: in an environment where the listener can be programmatically closed mid-serve, trigger a `Serve()` error simultaneously with `ctx` cancellation. `Run` must wait for the serve goroutine to exit and propagate the non-`ErrServerClosed` error from `errCh` instead of silently returning `nil` from the shutdown branch.
 - `Run` shutdown happy path: bind to `127.0.0.1:0`, cancel `ctx`, verify `Run` returns `nil` and the listener is closed (subsequent `net.Dial` to the bound address fails).
+- `Run` shutdown ordering — sync is in-flight when bind fails: install a mock GitHub client whose first list call blocks on a test channel until released. Pre-bind the target port with a sentinel listener so `Run`'s `Server.Listen(addr)` will fail with "address already in use". Call `Run` and assert: (1) it returns the wrapped bind error, (2) the test channel was reached (proving the syncer goroutine actually began a `RunOnce` before the bind error fired), (3) by the time `Run` returns, the syncer goroutine has fully exited (probe `Stop()` already returned and a follow-up `Status()` shows `Running: false`), and (4) the DB handle is closed AFTER the syncer goroutine exited, not before. The release of the test channel happens automatically once `cancelSync()` is called inside `Run`'s deferred chain — the mock detects the canceled context and unblocks. This is the regression guard for the shutdown race where `defer app.DB.Close()` would otherwise run while a `RunOnce` was still mid-flight after a bind error.
+- `Run` shutdown ordering — sync is in-flight when serve errors: identical setup, but instead of pre-binding, force `Server.Serve()` to return a non-`ErrServerClosed` error mid-flight (e.g., by closing `s.listener` directly from the test once the serve goroutine has started). Assert the same four properties: the wrapped serve error is returned, the syncer goroutine actually began a `RunOnce` first, `Stop()` had returned by the time `Run` unwinds, and the DB close ran strictly after the syncer goroutine exited.
 - Pre-`Serve` shutdown regression test (direct `*Server` lifecycle, not through `Run`): in `internal/server/server_test.go`, construct a `*Server`, call `Listen("127.0.0.1:0")` to bind the socket, capture the bound address via `s.listener.Addr().String()`, then call `Shutdown(ctx)` **before** `Serve()` is ever invoked. Assert (1) `Shutdown` returns `nil`, (2) the bound port is released — a fresh `net.Listen("tcp", boundAddr)` on the same address must succeed (fail fast if the port is still held), (3) a subsequent call to `Serve()` returns `http.ErrServerClosed` (not a raw listener-close error), proving the `httpSrv.Shutdown` step set `inShutdown` atomically even though no listener was adopted. This is the regression guard for the shutdown-ordering bug where closing the listener before `httpSrv.Shutdown` would leak the port (first version) or where closing the listener first in the post-`Serve` case would cause `Serve` to return a raw close error (second version). Note: because port reuse is subject to `TIME_WAIT` on some systems, the test may need to enable `SO_REUSEADDR` on the probing listener or use a dial-failure check instead (`net.DialTimeout` to the address returns an error within a short deadline).
 - SSE handler flush-on-error: wrap an `httptest.ResponseRecorder` with a custom writer whose `FlushError() error` method (the Go 1.20+ hook used by `http.NewResponseController(w).Flush()`) succeeds for the first N calls and returns a synthetic error on a later call. Drive the handler so that the first `rc.Flush()` (header flush in step 2) and the cached initial `sync_status` flush in the first select-loop iteration both succeed, then trigger a broadcast that causes the NEXT flush (either an event flush from step 5 or a keepalive flush from the ticker) to fail. Verify the handler returns promptly on that later flush error rather than looping on stale state. This ensures implementations cannot ignore post-write flush failures and still pass the test.
 - Syncer with `onStatusChange`: callback fires for started/progress/complete transitions
 - Syncer with `IsNotModified`: verify PR processing is skipped on 304, CI refresh still runs with cached head SHAs, issue sync still runs on PR list 304
+- `Syncer.Stop()` waits for in-flight `RunOnce`: install a mock client whose list call blocks on a test channel. Call `Start(ctx)`, wait until the mock confirms the goroutine entered the blocked list call, then call `Stop()` from the test goroutine and assert it does NOT return immediately — measure that `Stop()` only returns after the mock channel is released (or after the parent ctx is canceled, which the test does manually to drive the unblock). Without the `done` channel and the `<-s.done` wait, this test would race and `Stop()` would return immediately. Direct unit-level guard for the waitable-shutdown contract.
+- `Syncer.Stop()` is idempotent: call `Stop()` twice in sequence on a stopped syncer; the second call must return without panicking on a double-close of `stopCh` (verifies the `sync.Once` guard).
+- Hub slow-consumer disconnect: subscribe with a context that does not cancel, then call `Broadcast` 17 times in a row (one more than the buffer). Assert that the 17th broadcast removes the subscriber from the hub's map AND closes the channel (the test reads from the channel and observes `ok == false` once the buffered events are drained). Then broadcast a `data_changed` event and assert it is NOT delivered to the closed channel — proving the hub does not panic and the closed subscriber stays gone. Regression guard for the silent-drop bug where a slow consumer would lose terminal events forever.
+- SSE handler exits cleanly on hub-side channel close: open a real SSE subscription via `httptest`, then from the test deliberately overrun the buffer to make the hub close the subscriber's channel. Read the response body and assert (a) the handler returns without writing any zero-value `event: \ndata: {}\n\n` frames, (b) the connection closes from the server side (subsequent reads return EOF), and (c) reconnecting yields the cached `lastSyncStatus` as the first frame on the new subscription. End-to-end check that the two-value receive plus hub close path is wired correctly.
 
 ### Frontend Tests
 
@@ -714,7 +754,8 @@ When SSE is connected:
 | `internal/server/server.go` | Add `EventHub` field, register `GET /api/v1/events` handler using `http.NewResponseController(w)` for flushable writes, wire syncer callback via `SetOnStatusChange`, prime the hub with `Broadcast(sync_status)` from `syncer.Status()` during server construction. **Remove** the old `ListenAndServe(addr)` method and replace it with three explicit lifecycle methods: `Listen(addr string) error` synchronously creates the `*http.Server` (SSE-friendly `WriteTimeout: 0`, existing `ReadTimeout: 15s`, `IdleTimeout: 60s`) AND calls `net.Listen("tcp", addr)` AND stores the resulting listener into `s.listener` — returning any bind error directly; `Serve() error` calls `s.httpSrv.Serve(s.listener)` against the already-bound listener (never attempts a bind itself); `Shutdown(ctx context.Context) error` calls `s.httpSrv.Shutdown(ctx)` (which closes the listener) and is a no-op when `Listen` was never called. Binding in `Listen` and removing `ListenAndServe` entirely ensures bind errors surface synchronously to `Run` and cannot be masked by an early `ctx` cancellation. |
 | `cmd/middleman/main.go` | Replace inline wiring with a single call to `Run(ctx, cfg, configPath, ghClient, addr)`. `main.go` does not reference `app.Syncer` or `app.Server` directly — `Run` sequences `Bootstrap` → `Syncer.Start` → `Server.Listen` → `Server.Serve` (goroutine) → `Server.Shutdown` on ctx cancel. Enforced by `main_ast_test.go`. |
 | `internal/github/client.go` | Wrap OAuth2 transport with `etagTransport` in `NewClient` |
-| `internal/github/sync.go` | Add `onStatusChange` callback + setter, `headSHAs` cache, `IsNotModified` checks at 2 call sites, `refreshCIForExistingPRs` helper, refactor `refreshCIStatus` to take `number int, headSHA string` instead of `*gh.PullRequest` |
+| `internal/github/sync.go` | Add `onStatusChange` callback + setter, `headSHAs` cache, `IsNotModified` checks at 2 call sites, `refreshCIForExistingPRs` helper, refactor `refreshCIStatus` to take `number int, headSHA string` instead of `*gh.PullRequest`. **Make `Stop()` waitable**: add a `done chan struct{}` and `stopOnce sync.Once` field on the `Syncer`, have the `Start` goroutine `defer close(s.done)` as its first deferred action, and rewrite `Stop()` to `s.stopOnce.Do(func() { close(s.stopCh) }); <-s.done`. This is what lets `Run` close the DB strictly after the sync goroutine has exited. |
+| `cmd/middleman/app.go` (already in New Files) | Note that `Run`'s deferred chain establishes the shutdown order with care: the deferred `app.DB.Close()` is registered first so it runs LAST, and the deferred `cancelSync(); app.Syncer.Stop()` is registered after it so it runs first, blocking on the sync goroutine's exit before the DB is closed. `Run` creates `syncCtx, cancelSync := context.WithCancel(ctx)` and passes `syncCtx` to `Syncer.Start` so the deferred `cancelSync()` actually unblocks any in-flight HTTP request inside `RunOnce` even on the bind-error path where the parent `ctx` was never canceled. |
 | `frontend/src/lib/stores/sync.svelte.ts` | Add `updateSyncFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
 | `frontend/src/lib/stores/activity.svelte.ts` | Add `refreshFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
 | `frontend/src/lib/stores/detail.svelte.ts` | Add `refreshFromSSE`, `enablePolling`/`disablePolling`, `pollingEnabled` flag |
