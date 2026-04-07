@@ -400,16 +400,22 @@ The change has two parts:
 
 2. **Manual RunOnce tracking via WaitGroup.** The current codebase launches manual sync runs from two API handlers (`internal/server/huma_routes.go:775` and `internal/server/settings_handlers.go:147`) with `go s.syncer.RunOnce(context.WithoutCancel(r.Context()))`. These goroutines are independent of `Start`'s ticker and would otherwise still be writing to SQLite after the ticker goroutine exits and `DB.Close()` runs — a real shutdown race the spec must close. The fix is to wrap **every** `RunOnce` call (the ticker-driven one inside the `Start` goroutine, and both API-handler call sites) in a `sync.WaitGroup` owned by the Syncer.
 
-   `NewSyncer` allocates the lifetime state up front so it is valid before `Start` is ever called:
+   `NewSyncer` allocates the lifetime state up front so it is valid before `Start` is ever called. The lifecycle is serialized by a single `sync.Mutex` rather than a constellation of `atomic.Bool` and `sync.Once` values — the mutex makes the happens-before relationship between `Start`, `Stop`, and `TriggerRun` explicit, eliminating WaitGroup-misuse races where a `wg.Add(1)` could land after a concurrent `Stop`'s `wg.Wait()` had already returned with counter zero:
 
    ```go
    type Syncer struct {
        // ... existing fields ...
+
+       // lifecycleMu serializes Start, Stop, and TriggerRun. It is
+       // ONLY held during the short bookkeeping critical sections
+       // (registering wg slots, flipping started/stopped, closing
+       // stopCh) — never across RunOnce calls or channel waits.
+       lifecycleMu    sync.Mutex
+       started        bool // guarded by lifecycleMu
+       stopped        bool // guarded by lifecycleMu
+
        done           chan struct{}
-       doneOnce       sync.Once     // guards close(s.done), used by both Start's goroutine and Stop
-       stopOnce       sync.Once     // guards close(s.stopCh) + lifetimeCancel + the stoppedAtomic store
-       started        atomic.Bool   // CASed true on Start entry; makes a second Start a no-op
-       stoppedAtomic  atomic.Bool   // set true inside stopOnce.Do; makes a Start-after-Stop a no-op
+       stopCh         chan struct{}
        wg             sync.WaitGroup
        lifetimeCtx    context.Context
        lifetimeCancel context.CancelFunc
@@ -417,7 +423,8 @@ The change has two parts:
 
    func NewSyncer(/*...*/) *Syncer {
        s := &Syncer{ /*...*/
-           done: make(chan struct{}),
+           done:   make(chan struct{}),
+           stopCh: make(chan struct{}),
        }
        s.lifetimeCtx, s.lifetimeCancel = context.WithCancel(context.Background())
        return s
@@ -426,11 +433,19 @@ The change has two parts:
 
    `lifetimeCtx` is owned by the Syncer for its entire lifetime — it is created in `NewSyncer`, not in `Start`, so `TriggerRun` is valid before `Start` runs (and before `Stop`). `Start` simply links the caller's parent ctx into the cancellation chain by spawning a goroutine that calls `s.lifetimeCancel()` when the parent ctx is canceled, in addition to the existing stopCh / parent-ctx select inside the ticker loop.
 
-   `TriggerRun` is the public wrapper that handler code calls instead of `go s.syncer.RunOnce(...)`. It uses `s.lifetimeCtx` (not the caller's request ctx) so the run survives request completion but is still canceled at syncer shutdown:
+   `TriggerRun` is the public wrapper that handler code calls instead of `go s.syncer.RunOnce(...)`. It uses `s.lifetimeCtx` (not the caller's request ctx) so the run survives request completion but is still canceled at syncer shutdown. **Critically, `TriggerRun` registers its `wg` slot under the lifecycle lock**, so a concurrent `Stop` cannot interleave between the `wg.Add(1)` and `wg.Wait()` and miss the new run:
 
    ```go
    func (s *Syncer) TriggerRun() {
-       s.wg.Add(1)
+       s.lifecycleMu.Lock()
+       if s.stopped {
+           // Shutdown already in progress; refuse new work so it
+           // cannot escape Stop's wg.Wait().
+           s.lifecycleMu.Unlock()
+           return
+       }
+       s.wg.Add(1) // claim the slot BEFORE releasing the mutex
+       s.lifecycleMu.Unlock()
        go func() {
            defer s.wg.Done()
            s.RunOnce(s.lifetimeCtx)
@@ -438,24 +453,33 @@ The change has two parts:
    }
    ```
 
-   The ticker goroutine inside `Start` tracks every per-cycle `RunOnce` call via the same `wg`. Adding `s.wg.Add(1) / defer s.wg.Done()` directly inside the existing goroutine — instead of routing through a helper method — keeps the AST guardrail simple (only the `Start` method's body needs to be on the exemption list, no extra helper to enumerate):
+   `Start` performs the same trick: it claims wg slots for the goroutines it is about to launch **inside** the lifecycle critical section, so a `Stop` that takes the mutex after `Start` releases it is guaranteed to see `wg` counter ≥ 2 when it eventually calls `wg.Wait()`. Adding `s.wg.Add(1) / s.wg.Done()` directly around each per-cycle `RunOnce` inside the existing goroutine — instead of routing through a helper method — keeps the AST guardrail simple (only the `Start` method's body needs to be on the exemption list, no extra helper to enumerate):
 
    ```go
    func (s *Syncer) Start(ctx context.Context) {
-       // Reject Start after Stop: once Stop has run, the syncer is
-       // terminal. Start-after-Stop is never a valid sequence in the
-       // production Run wiring and would create a lifecycle tangle.
-       if !s.started.CompareAndSwap(false, true) {
-           return // Start was already called.
-       }
-       if s.stoppedAtomic.Load() {
-           // Stop beat us here; do not launch goroutines on a
-           // terminal syncer. done is already closed.
+       s.lifecycleMu.Lock()
+       if s.started || s.stopped {
+           // Double-Start is a no-op; Start-after-Stop is rejected
+           // because the syncer is terminal once Stop has run.
+           s.lifecycleMu.Unlock()
            return
        }
+       s.started = true
+       // Reserve wg slots for the two goroutines we are about to
+       // launch BEFORE releasing the mutex. Any concurrent Stop will
+       // block on the mutex; once it acquires the mutex it sees
+       // started=true, and when it later calls wg.Wait() the counter
+       // is already at least 2. This closes the race where Stop
+       // could otherwise reach wg.Wait() with counter=0 and return
+       // before the ticker goroutine had a chance to register its
+       // first wg.Add(1).
+       s.wg.Add(2)
+       s.lifecycleMu.Unlock()
+
        // Link the parent ctx into the lifetime cancellation chain so
        // a parent cancellation propagates to in-flight TriggerRun calls.
        go func() {
+           defer s.wg.Done()
            select {
            case <-ctx.Done():
                s.lifetimeCancel()
@@ -464,9 +488,10 @@ The change has two parts:
            }
        }()
        go func() {
-           // Close done via the shared sync.Once so Stop and Start's
-           // goroutine cannot race on double-close.
-           defer s.doneOnce.Do(func() { close(s.done) })
+           defer s.wg.Done()
+           // Only this goroutine ever closes done in the started path.
+           // The Stop-without-Start path closes done itself (see Stop).
+           defer close(s.done)
            // Ticker-driven runs are also tracked by wg so Stop blocks
            // on the in-flight one even if stopCh fires mid-cycle.
            s.wg.Add(1)
@@ -494,32 +519,44 @@ The change has two parts:
 
    ```go
    func (s *Syncer) Stop() {
-       s.stopOnce.Do(func() {
-           close(s.stopCh)
-           s.lifetimeCancel() // unblock any in-flight TriggerRun
-           s.stoppedAtomic.Store(true)
-           // If Start was never called, no ticker goroutine exists
-           // to close done. Close it here via the same sync.Once
-           // that Start's goroutine uses, so the two paths can never
-           // double-close. Safe to call unconditionally — doneOnce
-           // ensures only the first caller actually closes.
-           s.doneOnce.Do(func() { close(s.done) })
-       })
-       <-s.done    // wait for the ticker goroutine (if it ran)
+       s.lifecycleMu.Lock()
+       if s.stopped {
+           s.lifecycleMu.Unlock()
+           return
+       }
+       s.stopped = true
+       wasStarted := s.started
+       close(s.stopCh)
+       s.lifetimeCancel() // unblock any in-flight TriggerRun
+       s.lifecycleMu.Unlock()
+
+       if wasStarted {
+           // Ticker goroutine will close done as it exits.
+           <-s.done
+       } else {
+           // No ticker goroutine exists, so nobody else will ever
+           // close done. Close it here so any waiter (e.g. a future
+           // <-s.done in a test) does not deadlock.
+           close(s.done)
+       }
        s.wg.Wait() // wait for any in-flight RunOnce, ticker- or handler-driven
    }
    ```
 
+   The mutex is held only during short bookkeeping windows; the long waits (`<-s.done`, `s.wg.Wait()`) happen **outside** the critical section, so a concurrent `TriggerRun` that runs before `Stop` is invoked can still be observed by `Stop`'s `wg.Wait()`. The mutex's only job is to make the start/stop/register transitions atomic with respect to each other.
+
    The two `internal/server/*.go` call sites change from `go s.syncer.RunOnce(...)` to `s.syncer.TriggerRun()`. After the change, no caller in the codebase launches a bare `go RunOnce`; the wrapper is the only way to fire-and-forget a run.
 
-   **Note on `<-s.done` when `Start` was never called:** in test setups that use `TriggerRun` without `Start`, no ticker goroutine ever runs. The `doneOnce` `sync.Once` is shared between `Start`'s goroutine (which closes `done` as its final deferred action) and `Stop` (which closes `done` from inside the `stopOnce` block). Whichever path runs first wins; the other is a no-op. The order is safe because:
-   - If `Start` runs first and then `Stop`: `Start`'s goroutine will eventually exit (either via `ctx.Done` / `stopCh`) and its deferred `doneOnce.Do` closes `done`. When `Stop` runs later, its own `doneOnce.Do` is a no-op, and `<-s.done` returns immediately.
-   - If `Stop` runs first (before `Start`): the `stopOnce` block sets `stoppedAtomic` and closes `done` via `doneOnce.Do`. If someone then calls `Start`, `Start`'s first check `started.CompareAndSwap(false, true)` succeeds but the subsequent `stoppedAtomic.Load()` returns true and `Start` returns without launching any goroutine, so the `defer doneOnce.Do(close)` inside Start's goroutine never executes.
-   - If `Start` and `Stop` race: `started.CompareAndSwap` serializes so only one side launches the goroutines. If Start wins, Stop's later `doneOnce.Do` is a no-op. If Stop wins (started was already true from an earlier Start, but that earlier Start's goroutine hasn't exited yet), `stopOnce` still runs its block, but the `doneOnce.Do` inside the block races with the `defer doneOnce.Do` in the goroutine — one wins, the other is a no-op. No double-close.
+   **Why the mutex over atomics:** earlier drafts of this design used `sync.Once` + `atomic.Bool` flags and the WaitGroup race rules subtly bit them. The pathology: `Start` spawns the ticker goroutine but the goroutine has not yet executed `wg.Add(1)` when a concurrent `Stop` reaches `wg.Wait()`. With counter zero, `Wait` returns immediately and `Stop` declares shutdown complete; meanwhile the delayed ticker goroutine still runs `RunOnce` against a possibly-closed DB. Symmetrically, `TriggerRun`'s unconditional `wg.Add(1)` could land after `Stop`'s `wg.Wait()` had returned, again letting a sync escape shutdown. The lifecycle mutex closes both holes by ensuring the wg-slot reservation for Start's goroutines and TriggerRun's goroutine happens-before any `Stop` that could observe `wasStarted=true` or `stopped=true`. `Stop` always sees `wg` counter at the value the mutex hand-off established, so `Wait` cannot return early.
 
-   After these fixes, `Stop` is well-defined regardless of whether `Start` was called, and `Start` after `Stop` is an explicit no-op (documented contract). The combination of `doneOnce`, `stoppedAtomic`, and the `started` CAS guarantees no panic on any interleaving.
+   **Interleaving cases:**
+   - `Start` then `Stop`: Start takes the mutex, sets `started=true`, `wg.Add(2)`, releases the mutex, spawns goroutines. Stop later takes the mutex, sets `stopped=true`, sees `wasStarted=true`, releases. Stop waits on `<-s.done` (closed by the ticker goroutine) and `wg.Wait()` (drains all per-cycle and TriggerRun adds). Correct.
+   - `Stop` then `Start`: Stop takes the mutex, sets `stopped=true`, `wasStarted=false`, releases. Stop closes `s.done` itself and `wg.Wait()` returns immediately (counter is 0). Start later takes the mutex, sees `stopped=true`, releases without launching goroutines. The syncer is terminal. Correct.
+   - `Start` racing `Stop`: exactly one wins the mutex first, reducing to one of the above cases. There is no third interleaving.
+   - `TriggerRun` racing `Stop`: if `TriggerRun` wins the mutex first, it does `wg.Add(1)` and spawns the goroutine; `Stop` later takes the mutex, then `wg.Wait()` will block until the goroutine's `defer wg.Done()` runs. The goroutine sees `lifetimeCtx` already canceled (by Stop) and returns quickly via `RunOnce`'s ctx checks. If `Stop` wins the mutex first, `TriggerRun` later sees `stopped=true` and returns without registering any work.
+   - Double `Start` or double `Stop`: the second call sees `started` or `stopped` already true and returns. Correct.
 
-The `sync.Once` guard makes `Stop` idempotent so a second call (e.g., test cleanup followed by `Run`'s deferred Stop) does not panic on double-close. `<-s.done` and `s.wg.Wait()` are both safe to call multiple times.
+The lifecycle mutex makes `Stop` idempotent (a second `Stop` returns at the `if s.stopped` check) without needing `sync.Once`. `<-s.done` and `s.wg.Wait()` are both safe to call multiple times in their own right.
 
 Effective shutdown sequence in `Run`: the deferred `cancelSync()` (which cancels the `syncCtx` passed to `Start`) propagates through the linker goroutine to `lifetimeCancel`, which unblocks any in-flight HTTP call inside both ticker- and handler-driven `RunOnce` invocations. The deferred `Stop()` then closes `stopCh`, waits for the ticker goroutine on `done`, and waits for `wg` to drain. Only then does `defer DB.Close()` run.
 
@@ -829,11 +866,13 @@ When SSE is connected:
 - Syncer with `onStatusChange`: callback fires for started/progress/complete transitions
 - Syncer with `IsNotModified`: verify PR processing is skipped on 304, CI refresh still runs with cached head SHAs, issue sync still runs on PR list 304
 - `Syncer.Stop()` waits for in-flight `RunOnce`: install a mock client whose list call blocks on a test channel. Call `Start(ctx)`, wait until the mock confirms the goroutine entered the blocked list call, then call `Stop()` from the test goroutine and assert it does NOT return immediately — measure that `Stop()` only returns after the mock channel is released (or after the parent ctx is canceled, which the test does manually to drive the unblock). Without the `done` channel and the `<-s.done` wait, this test would race and `Stop()` would return immediately. Direct unit-level guard for the waitable-shutdown contract.
-- `Syncer.Stop()` waits for handler-triggered `TriggerRun` **without ever calling `Start`**: same mock-blocking-channel setup, but the test never calls `Start(ctx)`. It calls `NewSyncer(...)` then `TriggerRun()` directly, simulating an API handler firing on a syncer that was just constructed. Wait until the mock confirms the goroutine entered the blocked list call, then call `Stop()` from a separate goroutine. Assert (1) `Stop()` initially blocks (the in-flight `RunOnce` is not done), (2) `Stop()`'s `lifetimeCancel()` actually unblocks the in-flight HTTP call inside `RunOnce` (because the mock observes `lifetimeCtx.Done()`), and (3) `Stop()` returns shortly after. This is the regression guard for the contradiction where `done` would otherwise never close (no ticker goroutine ever ran) and `Stop` would wait forever on `<-s.done`. The fix — `NewSyncer` allocating `lifetimeCtx`/`lifetimeCancel` up front, and `Stop` closing `done` via the shared `doneOnce` inside its `stopOnce.Do` block whether or not `Start` ever ran — is verified by this test.
+- `Syncer.Stop()` waits for handler-triggered `TriggerRun` **without ever calling `Start`**: same mock-blocking-channel setup, but the test never calls `Start(ctx)`. It calls `NewSyncer(...)` then `TriggerRun()` directly, simulating an API handler firing on a syncer that was just constructed. Wait until the mock confirms the goroutine entered the blocked list call, then call `Stop()` from a separate goroutine. Assert (1) `Stop()` initially blocks (the in-flight `RunOnce` is not done), (2) `Stop()`'s `lifetimeCancel()` actually unblocks the in-flight HTTP call inside `RunOnce` (because the mock observes `lifetimeCtx.Done()`), and (3) `Stop()` returns shortly after. This is the regression guard for the contradiction where `done` would otherwise never close (no ticker goroutine ever ran) and `Stop` would wait forever on `<-s.done`. The fix — `NewSyncer` allocating `lifetimeCtx`/`lifetimeCancel` up front, and `Stop` closing `done` itself when `wasStarted` is false — is verified by this test.
 - `Syncer.Stop()` waits for handler-triggered `TriggerRun` **after `Start`**: same as above but the test calls `Start(ctx)` first. Verifies that the same `Stop` semantics hold when both ticker- and handler-driven runs are in flight.
-- `Syncer.Stop()` is idempotent: call `Stop()` twice in sequence on a stopped syncer; the second call must return without panicking on a double-close of `stopCh` (verifies the `sync.Once` guard).
-- `Syncer.Start()` after `Stop()` is a no-op: call `NewSyncer(...)`, then `Stop()`, then `Start(ctx)`. Assert `Start` returns without launching any goroutine (no subsequent `RunOnce` is ever observed on the mock GitHub client, and `Status().Running` stays `false`). Verifies the `stoppedAtomic.Load()` guard inside `Start`.
-- `Syncer.Start()` called twice is a no-op on the second call: call `Start(ctx)` twice in sequence. Assert the second call does not spawn a second ticker goroutine — the mock GitHub client should observe only one `RunOnce` per tick interval, not two. Verifies the `started.CompareAndSwap` guard.
+- `Syncer.Stop()` is idempotent: call `Stop()` twice in sequence on a stopped syncer; the second call must return at the `if s.stopped` mutex-guarded check without panicking on a double-close of `stopCh`.
+- `Syncer.Start()` after `Stop()` is a no-op: call `NewSyncer(...)`, then `Stop()`, then `Start(ctx)`. Assert `Start` returns without launching any goroutine (no subsequent `RunOnce` is ever observed on the mock GitHub client, and `Status().Running` stays `false`). Verifies the `if s.started || s.stopped` mutex-guarded check inside `Start`.
+- `Syncer.Start()` called twice is a no-op on the second call: call `Start(ctx)` twice in sequence. Assert the second call does not spawn a second ticker goroutine — the mock GitHub client should observe only one `RunOnce` per tick interval, not two. Verifies the same mutex-guarded check.
+- **`Syncer.Stop()` does NOT race past a freshly-spawned ticker goroutine that has not yet reached `wg.Add(1)`**: this is the regression guard for the WaitGroup race where `Start` spawns the goroutine and `Stop` immediately runs `wg.Wait()` with counter zero. The test uses a hostile scheduler to maximize the chance of the race: call `Start(ctx)` then immediately (in the same goroutine, no `time.Sleep` between them) call `Stop()`. The mock GitHub client's first list call records its invocation timestamp into a buffered channel. Assert (1) `Stop()` returns AFTER the mock recorded the first list invocation (proving Stop did not race past the spawn-but-not-yet-Add window), and (2) no further mock list calls happen after `Stop()` returns. Run with `-race` enabled to catch concurrent map writes, etc. Without the `wg.Add(2)` reservation under the lifecycle mutex inside `Start`, `Stop` could in principle see counter zero and return before the mock was ever called. The test should be repeated 100+ times in a loop (or with `go test -count=N`) to flush out scheduling races.
+- **`Syncer.TriggerRun()` racing `Stop()` does NOT let a sync escape shutdown**: test creates a Syncer, spawns `TriggerRun()` and `Stop()` concurrently (paired in tight loops with `runtime.Gosched()` between iterations to interleave them). After the join, assert that no `RunOnce` was launched after `Stop` returned: instrument the mock client to record the order of (Stop returned, RunOnce started) events and assert no RunOnce-start follows the Stop-returned timestamp. The lifecycle mutex on TriggerRun's check-and-Add path is what makes this safe — without it, TriggerRun could `wg.Add(1)` after Stop's `wg.Wait()` had returned. Run repeatedly under `-race`.
 - `RunOnce` AST guardrail. The bare-`go RunOnce` regression check lives in **three coordinated AST tests**, because the call sites it must protect span three packages: `cmd/middleman` (where `Run` composes lifecycle calls), `internal/server` (where handlers fire manual syncs at `huma_routes.go:775` and `settings_handlers.go:147`), and `internal/github` itself (where `*Syncer.Start`'s inlined ticker-driven `RunOnce` call and the new `*Syncer.TriggerRun` wrapper live — any future bare `RunOnce` added anywhere else in `internal/github` would bypass a guard scoped only to the other two packages). The three tests share the same forbidden-set construction logic via a small helper, and each scopes its `go/packages` load to the package whose call sites it protects:
   - Extension to `cmd/middleman/main_ast_test.go`: `RunOnce` is added to the forbidden set built from `types.NewMethodSet(*Syncer)`. The only exempted FuncDecl in this package is the already-covered package-level `Run` in `app.go`. `*Syncer.Start` and `*Syncer.TriggerRun` cannot be exempted here because their bodies live in `internal/github`, not in `cmd/middleman`, so they are not visible to the `go/packages` load scoped to this package — their exemptions belong in the `internal/github` companion test instead.
   - New file `internal/server/server_ast_test.go`: loads the `internal/server` package with `go/packages` and runs the same selector-walking visitor against the same forbidden set. There are no exempted FuncDecls in this package — the only legal call to drive a sync from anywhere in `internal/server` is `s.syncer.TriggerRun()`, which is a different method (`TriggerRun`), not `RunOnce`, so it never appears in the AST as a `RunOnce` selector. Any future bare `go s.syncer.RunOnce(...)` inside `internal/server` fails this test.
@@ -883,7 +922,7 @@ When SSE is connected:
 | `internal/server/server.go` | Add `EventHub` field, register `GET /api/v1/events` handler using `http.NewResponseController(w)` for flushable writes, wire syncer callback via `SetOnStatusChange`, prime the hub with `Broadcast(sync_status)` from `syncer.Status()` during server construction. **Remove** the old `ListenAndServe(addr)` method and replace it with three explicit lifecycle methods: `Listen(addr string) error` synchronously creates the `*http.Server` (SSE-friendly `WriteTimeout: 0`, existing `ReadTimeout: 15s`, `IdleTimeout: 60s`) AND calls `net.Listen("tcp", addr)` AND stores the resulting listener into `s.listener` — returning any bind error directly; `Serve() error` calls `s.httpSrv.Serve(s.listener)` against the already-bound listener (never attempts a bind itself); `Shutdown(ctx context.Context) error` calls `s.httpSrv.Shutdown(ctx)` (which closes the listener) and is a no-op when `Listen` was never called. Binding in `Listen` and removing `ListenAndServe` entirely ensures bind errors surface synchronously to `Run` and cannot be masked by an early `ctx` cancellation. |
 | `cmd/middleman/main.go` | Replace inline wiring with a single call to `Run(ctx, cfg, configPath, ghClient, addr)`. `main.go` does not reference `app.Syncer` or `app.Server` directly — `Run` sequences `Bootstrap` → `Syncer.Start` → `Server.Listen` → `Server.Serve` (goroutine) → `Server.Shutdown` on ctx cancel. Enforced by `main_ast_test.go`. |
 | `internal/github/client.go` | Wrap OAuth2 transport with `etagTransport` in `NewClient` |
-| `internal/github/sync.go` | Add `onStatusChange` callback + setter, `headSHAs` cache, `IsNotModified` checks at 2 call sites, `refreshCIForExistingPRs` helper, refactor `refreshCIStatus` to take `number int, headSHA string` instead of `*gh.PullRequest`. **Make `Stop()` waitable across both ticker- and handler-driven runs**: add `done chan struct{}`, `doneOnce sync.Once`, `stopOnce sync.Once`, `started atomic.Bool`, `stoppedAtomic atomic.Bool`, `wg sync.WaitGroup`, and a `lifetimeCtx` / `lifetimeCancel` pair to the `Syncer` (all allocated in `NewSyncer` so the lifetime state is valid before `Start` runs). `Start` guards against double-Start via `started.CompareAndSwap` and against Start-after-Stop via `stoppedAtomic.Load`, then inlines `wg.Add(1) / s.RunOnce(ctx) / wg.Done()` directly inside its ticker goroutine (not in a helper) so the AST guardrail only needs to exempt `Start` by FuncDecl identity. The ticker goroutine's final `defer` closes `s.done` via `doneOnce.Do` so `Stop` and the goroutine cannot double-close. Add a public `TriggerRun()` wrapper (no ctx parameter) that handler code calls instead of `go s.syncer.RunOnce(...)`; `TriggerRun` increments `wg`, spawns the goroutine, and runs `RunOnce(s.lifetimeCtx)` so manual runs are bounded by the syncer's own lifetime, not the request lifecycle. `Stop()` runs `stopOnce.Do({ close(stopCh); lifetimeCancel(); stoppedAtomic.Store(true); doneOnce.Do(close(done)) })` followed by `<-s.done; s.wg.Wait()`. The two server-side handlers (`huma_routes.go:775`, `settings_handlers.go:147`) change from `go s.syncer.RunOnce(context.WithoutCancel(...))` to `s.syncer.TriggerRun()`. After this change there are no bare `go syncer.RunOnce` call sites in the codebase. |
+| `internal/github/sync.go` | Add `onStatusChange` callback + setter, `headSHAs` cache, `IsNotModified` checks at 2 call sites, `refreshCIForExistingPRs` helper, refactor `refreshCIStatus` to take `number int, headSHA string` instead of `*gh.PullRequest`. **Make `Stop()` waitable across both ticker- and handler-driven runs**: add `done chan struct{}`, `stopCh chan struct{}`, `lifecycleMu sync.Mutex`, `started bool` and `stopped bool` (both guarded by `lifecycleMu`), `wg sync.WaitGroup`, and a `lifetimeCtx` / `lifetimeCancel` pair to the `Syncer` (all allocated in `NewSyncer` so the lifetime state is valid before `Start` runs). `Start` takes the mutex, refuses if already started or stopped, sets `started=true`, **calls `wg.Add(2)` for the linker and ticker goroutines BEFORE releasing the mutex** so a concurrent `Stop` cannot reach `wg.Wait()` with counter zero, then spawns the goroutines outside the lock. Each goroutine has `defer wg.Done()`. The ticker goroutine inlines `wg.Add(1) / s.RunOnce(ctx) / wg.Done()` directly around each per-cycle run (no helper, so the AST guardrail only needs to exempt `Start` by FuncDecl identity). The ticker goroutine's `defer close(s.done)` is unconditional (only this goroutine closes done in the started path). Add a public `TriggerRun()` wrapper (no ctx parameter) that handler code calls instead of `go s.syncer.RunOnce(...)`. `TriggerRun` takes the mutex, refuses if `stopped`, calls `wg.Add(1)` BEFORE releasing the mutex, then spawns a goroutine with `defer wg.Done()` that runs `RunOnce(s.lifetimeCtx)` so manual runs are bounded by the syncer's own lifetime, not the request lifecycle. `Stop()` takes the mutex, refuses if already stopped, sets `stopped=true`, captures `wasStarted=s.started`, closes `stopCh`, calls `lifetimeCancel()`, releases the mutex, then either waits on `<-s.done` (if `wasStarted`) or closes `s.done` itself (if not), then `wg.Wait()`. The two server-side handlers (`huma_routes.go:775`, `settings_handlers.go:147`) change from `go s.syncer.RunOnce(context.WithoutCancel(...))` to `s.syncer.TriggerRun()`. After this change there are no bare `go syncer.RunOnce` call sites in the codebase. |
 | `internal/server/huma_routes.go` | Replace the bare `go s.syncer.RunOnce(context.WithoutCancel(ctx))` at line 775 with `s.syncer.TriggerRun()`. The wrapper takes no ctx parameter — it uses the syncer's own `lifetimeCtx` internally, so the handler does not need to construct one. |
 | `internal/server/settings_handlers.go` | Same change at line 147: replace the bare `go s.syncer.RunOnce(context.WithoutCancel(r.Context()))` with `s.syncer.TriggerRun()`. |
 | `cmd/middleman/app.go` (already in New Files) | Note that `Run`'s deferred chain establishes the shutdown order with care: the deferred `app.DB.Close()` is registered first so it runs LAST, and the deferred `cancelSync(); app.Syncer.Stop()` is registered after it so it runs first, blocking on the sync goroutine's exit before the DB is closed. `Run` creates `syncCtx, cancelSync := context.WithCancel(ctx)` and passes `syncCtx` to `Syncer.Start` so the deferred `cancelSync()` actually unblocks any in-flight HTTP request inside `RunOnce` even on the bind-error path where the parent `ctx` was never canceled. |
