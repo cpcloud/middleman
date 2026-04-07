@@ -835,7 +835,7 @@ App unmount    -> disconnect() (close EventSource)
 
 `connect()` is called from `App.svelte`'s `onMount`. `disconnect()` is called from `onDestroy`.
 
-**No event replay:** The SSE endpoint does not use event IDs or maintain a replay buffer. Events emitted during a brief SSE disconnection are lost. This is acceptable because: (a) polling re-enables immediately on disconnect and catches up within seconds for views whose polling timers are active (pull list, issue list, activity, detail — when their components are mounted), and (b) the `open` handler fires a full refresh on every (re)connect, so the client catches up with any `data_changed` events missed during the disconnection window without waiting for the next sync cycle. **Limitation:** status-bar counts (pull/issue totals, repo count) can go stale during an SSE outage if the user is on `activity` or `settings`, because `loadPulls()`/`loadIssues()` are only polled when their list/board components are mounted. This is acceptable — the counts are layout chrome, the outage is local and brief, and the `open` handler's full refresh corrects them on reconnect. Adding a global background poller for two badge numbers would add complexity for negligible benefit.
+**No event replay:** The SSE endpoint does not use event IDs or maintain a replay buffer. Events emitted during a brief SSE disconnection are lost. This is acceptable because: (a) polling re-enables immediately on disconnect and catches up within seconds for views whose polling timers are active (pull list, issue list, activity, detail — when their components are mounted), and (b) the `open` handler fires a full refresh on every (re)connect, so the client catches up with any `data_changed` events missed during the disconnection window without waiting for the next sync cycle. **Limitation:** status-bar counts (pull/issue totals, repo count) can go stale during an SSE outage on any view, because each view only polls its own store: `pulls` polls `loadPulls()` but not `loadIssues()`, `issues` polls `loadIssues()` but not `loadPulls()`, and `activity`/`settings` don't poll either list store. This is acceptable — the counts are layout chrome, the outage is local and brief, and the `open` handler's full refresh of both stores corrects them on reconnect. Adding a global background poller for two badge numbers would add complexity for negligible benefit.
 
 ### Fallback Behavior
 
@@ -844,7 +844,7 @@ When SSE is disconnected (fallback):
 - Pull/issue list polling: 15s (only when list/board components are mounted)
 - Activity polling: 15s (only when activity view is mounted)
 - Detail polling: 60s (only when detail panel is open)
-- Status-bar counts: not independently polled — updated on next reconnect or navigation to a list view
+- Status-bar counts: not independently polled — stale on any view during outage (pulls page misses issue changes, issues page misses pull changes, activity/settings miss both). Corrected on SSE reconnect (open handler calls both `loadPulls()` and `loadIssues()`)
 
 When SSE is connected:
 - All polling timers disabled
@@ -880,6 +880,9 @@ When SSE is connected:
 - Expired ETag entries (older than `etagTTL`) are treated as uncached
 - TTL-driven multi-page detection: cached single-page ETag, one or more 304s (which must NOT refresh `cachedAt`), then after `etagTTL` the next request omits `If-None-Match`, gets a 200 with `Link: rel="next"`, and evicts the cache entry
 - `IsNotModified` returns true for 304 errors, false for other errors
+- Gate: non-GET requests (POST, PATCH, DELETE) to allowlisted paths bypass cache entirely — no `If-None-Match` sent, no ETag stored, no cache eviction
+- Gate: GET requests to non-allowlisted paths (`/repos/{owner}/{name}/commits/{sha}/status`, `/repos/{owner}/{name}/commits/{sha}/check-runs`) bypass cache entirely — no `If-None-Match` sent even if a matching URL is in cache, no ETag stored on 200
+- Gate: GET request to allowlisted path with cached ETag gets `If-None-Match` (positive control, confirming the allowlist works)
 
 **Integration tests:**
 - SSE endpoint: returns `text/event-stream` content type, receives events after broadcast, connection closes cleanly on client disconnect
