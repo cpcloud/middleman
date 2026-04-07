@@ -1801,10 +1801,8 @@ func TestSSE_MarshalFailureContinuesServing(t *testing.T) {
 	defer resp.Body.Close()
 
 	// Single reader goroutine parses SSE frames and sends event types
-	// over a channel. Avoids per-read goroutine leaks. Scanner error
-	// is captured for assertion after the test completes.
+	// over a channel. Avoids per-read goroutine leaks.
 	events := make(chan string, 10)
-	var scanErr error
 	go func() {
 		defer close(events)
 		scanner := bufio.NewScanner(resp.Body)
@@ -1819,7 +1817,6 @@ func TestSSE_MarshalFailureContinuesServing(t *testing.T) {
 				evType = ""
 			}
 		}
-		scanErr = scanner.Err()
 	}()
 
 	// Read initial cached sync_status to confirm subscription is live
@@ -1841,11 +1838,13 @@ func TestSSE_MarshalFailureContinuesServing(t *testing.T) {
 		t.Fatal("timed out waiting for data_changed after marshal failure")
 	}
 
-	// Close body to unblock reader goroutine, drain channel, check scanner error
+	// Close body to unblock reader goroutine, then drain channel.
+	// scanner.Err() after forced close returns a read-on-closed-body
+	// error — that is expected cleanup, not a test failure. Stream
+	// health is validated by successful receipt of both events above.
 	resp.Body.Close()
 	for range events {
 	}
-	assert.NoError(t, scanErr, "scanner should not have errored")
 }
 
 func TestSSE_SlowConsumerDisconnect(t *testing.T) {
