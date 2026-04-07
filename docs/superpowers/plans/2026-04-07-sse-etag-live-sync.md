@@ -700,7 +700,7 @@ func hasLinkNext(resp *http.Response) bool {
 // response from the GitHub API.
 func IsNotModified(err error) bool {
 	var ghErr *gh.ErrorResponse
-	return errors.As(err, &ghErr) && ghErr.Response.StatusCode == http.StatusNotModified
+	return errors.As(err, &ghErr) && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusNotModified
 }
 ```
 
@@ -887,6 +887,9 @@ func TestIsNotModified(t *testing.T) {
 	assert.False(t, IsNotModified(err403))
 
 	assert.False(t, IsNotModified(errors.New("random error")))
+
+	errNilResp := &gh.ErrorResponse{Response: nil}
+	assert.False(t, IsNotModified(errNilResp), "nil Response should not panic")
 }
 ```
 
@@ -958,10 +961,11 @@ In `internal/github/sync.go`, add field to Syncer struct (after line 40):
 onStatusChange func(*SyncStatus)
 ```
 
-Add setter method:
+Add setter method. **Must be called before `Start`** — the callback is not synchronized; `RunOnce` single-flight via `atomic.CompareAndSwap` guarantees only one `RunOnce` executes at a time, so `onStatusChange` and `headSHAs` are only accessed from within `RunOnce` and are safe without additional locking:
 
 ```go
 // SetOnStatusChange registers a callback invoked on every status change.
+// Must be called before Start — not safe to call concurrently with RunOnce.
 func (s *Syncer) SetOnStatusChange(fn func(*SyncStatus)) {
 	s.onStatusChange = fn
 }
@@ -1696,11 +1700,12 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			_ = rc.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			data, err := json.Marshal(ev.Data)
 			if err != nil {
-				return
+				slog.Error("sse: marshal event", "type", ev.Type, "err", err)
+				continue
 			}
+			_ = rc.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, data); err != nil {
 				return
 			}
