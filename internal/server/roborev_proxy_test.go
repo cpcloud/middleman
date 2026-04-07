@@ -54,10 +54,11 @@ endpoint = %q
 
 	mock := &mockGH{}
 	syncer := ghclient.NewSyncer(
-		mock, database, nil, nil, time.Minute,
+		map[string]ghclient.Client{"github.com": mock},
+		database, nil, nil, time.Minute, nil,
 	)
 	return NewWithConfig(
-		database, mock, syncer, nil, nil, cfg, cfgPath,
+		database, syncer, nil, nil, cfg, cfgPath,
 		ServerOptions{},
 	)
 }
