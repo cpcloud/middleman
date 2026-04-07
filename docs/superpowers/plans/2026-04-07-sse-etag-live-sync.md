@@ -1787,6 +1787,34 @@ func TestSSE_ExitsCleanlyOnHubClose(t *testing.T) {
 	assert.NotContains(t, string(body), "event: \ndata:")
 }
 
+func TestSSE_MarshalFailureContinuesServing(t *testing.T) {
+	s := New(openTestDB(t), nil, nil, nil, "/")
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/events")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	// Broadcast an unmarshalable event (channels cannot be marshaled)
+	s.hub.Broadcast(Event{Type: "bad", Data: make(chan int)})
+	// Followed by a valid event
+	s.hub.Broadcast(Event{Type: "data_changed", Data: struct{}{}})
+
+	scanner := bufio.NewScanner(resp.Body)
+	var eventType string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "event: ") {
+			eventType = strings.TrimPrefix(line, "event: ")
+		}
+		if line == "" && eventType != "" {
+			break
+		}
+	}
+	assert.Equal(t, "data_changed", eventType, "valid event should arrive after marshal failure")
+}
+
 func TestSSE_SlowConsumerDisconnect(t *testing.T) {
 	s := New(openTestDB(t), nil, nil, nil, "/")
 	ts := httptest.NewServer(s)
