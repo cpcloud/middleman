@@ -1800,45 +1800,43 @@ func TestSSE_MarshalFailureContinuesServing(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	// Read the initial cached sync_status to confirm subscription is live
-	scanner := bufio.NewScanner(resp.Body)
-	readEvent := func(timeout time.Duration) (string, bool) {
-		done := make(chan struct{})
+	// Single reader goroutine parses SSE frames and sends event types
+	// over a channel. Avoids per-read goroutine leaks.
+	events := make(chan string, 10)
+	go func() {
+		defer close(events)
+		scanner := bufio.NewScanner(resp.Body)
 		var evType string
-		var found bool
-		go func() {
-			defer close(done)
-			for scanner.Scan() {
-				line := scanner.Text()
-				if strings.HasPrefix(line, "event: ") {
-					evType = strings.TrimPrefix(line, "event: ")
-				}
-				if line == "" && evType != "" {
-					found = true
-					return
-				}
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "event: ") {
+				evType = strings.TrimPrefix(line, "event: ")
 			}
-		}()
-		select {
-		case <-done:
-			return evType, found
-		case <-time.After(timeout):
-			return "", false
+			if line == "" && evType != "" {
+				events <- evType
+				evType = ""
+			}
 		}
-	}
+	}()
 
-	evType, ok := readEvent(5 * time.Second)
-	require.True(t, ok, "should receive initial sync_status")
-	assert.Equal(t, "sync_status", evType)
+	// Read initial cached sync_status to confirm subscription is live
+	select {
+	case ev := <-events:
+		assert.Equal(t, "sync_status", ev)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for initial sync_status")
+	}
 
 	// Now safe to broadcast — handler is subscribed
 	s.hub.Broadcast(Event{Type: "bad", Data: make(chan int)})
 	s.hub.Broadcast(Event{Type: "data_changed", Data: struct{}{}})
 
-	evType, ok = readEvent(5 * time.Second)
-	require.True(t, ok, "should receive valid event after marshal failure")
-	assert.Equal(t, "data_changed", evType, "valid event should arrive after marshal failure")
-	require.NoError(t, scanner.Err())
+	select {
+	case ev := <-events:
+		assert.Equal(t, "data_changed", ev, "valid event should arrive after marshal failure")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for data_changed after marshal failure")
+	}
 }
 
 func TestSSE_SlowConsumerDisconnect(t *testing.T) {
