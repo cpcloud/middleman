@@ -398,40 +398,72 @@ The change has two parts:
 
 1. **Background goroutine tracking.** `NewSyncer` creates `s.done = make(chan struct{})`. The goroutine spawned by `Start` does `defer close(s.done)` as its very first deferred call, so `done` is closed only after the ticker loop has returned.
 
-2. **Manual RunOnce tracking via WaitGroup.** The current codebase launches manual sync runs from two API handlers (`internal/server/huma_routes.go:775` and `internal/server/settings_handlers.go:147`) with `go s.syncer.RunOnce(context.WithoutCancel(r.Context()))`. These goroutines are independent of `Start`'s ticker and would otherwise still be writing to SQLite after the ticker goroutine exits and `DB.Close()` runs — a real shutdown race the spec must close. The fix is to wrap **every** `RunOnce` call (the ticker-driven one inside the `Start` goroutine, and both API-handler call sites) in a `sync.WaitGroup` owned by the Syncer:
+2. **Manual RunOnce tracking via WaitGroup.** The current codebase launches manual sync runs from two API handlers (`internal/server/huma_routes.go:775` and `internal/server/settings_handlers.go:147`) with `go s.syncer.RunOnce(context.WithoutCancel(r.Context()))`. These goroutines are independent of `Start`'s ticker and would otherwise still be writing to SQLite after the ticker goroutine exits and `DB.Close()` runs — a real shutdown race the spec must close. The fix is to wrap **every** `RunOnce` call (the ticker-driven one inside the `Start` goroutine, and both API-handler call sites) in a `sync.WaitGroup` owned by the Syncer.
+
+   `NewSyncer` allocates the lifetime state up front so it is valid before `Start` is ever called:
 
    ```go
    type Syncer struct {
        // ... existing fields ...
-       done     chan struct{}
-       stopOnce sync.Once
-       wg       sync.WaitGroup
+       done           chan struct{}
+       stopOnce       sync.Once
+       wg             sync.WaitGroup
+       lifetimeCtx    context.Context
+       lifetimeCancel context.CancelFunc
    }
 
-   // Public wrapper used by API handlers and tests, replacing
-   // direct go s.syncer.RunOnce(...) launches.
-   func (s *Syncer) TriggerRun(ctx context.Context) {
+   func NewSyncer(/*...*/) *Syncer {
+       s := &Syncer{ /*...*/
+           done: make(chan struct{}),
+       }
+       s.lifetimeCtx, s.lifetimeCancel = context.WithCancel(context.Background())
+       return s
+   }
+   ```
+
+   `lifetimeCtx` is owned by the Syncer for its entire lifetime — it is created in `NewSyncer`, not in `Start`, so `TriggerRun` is valid before `Start` runs (and before `Stop`). `Start` simply links the caller's parent ctx into the cancellation chain by spawning a goroutine that calls `s.lifetimeCancel()` when the parent ctx is canceled, in addition to the existing stopCh / parent-ctx select inside the ticker loop.
+
+   `TriggerRun` is the public wrapper that handler code calls instead of `go s.syncer.RunOnce(...)`. It uses `s.lifetimeCtx` (not the caller's request ctx) so the run survives request completion but is still canceled at syncer shutdown:
+
+   ```go
+   func (s *Syncer) TriggerRun() {
        s.wg.Add(1)
        go func() {
            defer s.wg.Done()
-           s.RunOnce(ctx)
+           s.RunOnce(s.lifetimeCtx)
        }()
    }
    ```
 
-   The ticker goroutine inside `Start` also tracks its own per-cycle `RunOnce` calls via the same `wg`:
+   The ticker goroutine inside `Start` tracks every per-cycle `RunOnce` call via the same `wg`. Adding `s.wg.Add(1) / defer s.wg.Done()` directly inside the existing goroutine — instead of routing through a helper method — keeps the AST guardrail simple (only the `Start` method's body needs to be on the exemption list, no extra helper to enumerate):
 
    ```go
    func (s *Syncer) Start(ctx context.Context) {
+       // Link the parent ctx into the lifetime cancellation chain so
+       // a parent cancellation propagates to in-flight TriggerRun calls.
+       go func() {
+           select {
+           case <-ctx.Done():
+               s.lifetimeCancel()
+           case <-s.done:
+               // Stop already fired; nothing to do.
+           }
+       }()
        go func() {
            defer close(s.done)
-           s.runOnceTracked(ctx) // initial sync
+           // Ticker-driven runs are also tracked by wg so Stop blocks
+           // on the in-flight one even if stopCh fires mid-cycle.
+           s.wg.Add(1)
+           s.RunOnce(ctx)
+           s.wg.Done()
            ticker := time.NewTicker(s.interval)
            defer ticker.Stop()
            for {
                select {
                case <-ticker.C:
-                   s.runOnceTracked(ctx)
+                   s.wg.Add(1)
+                   s.RunOnce(ctx)
+                   s.wg.Done()
                case <-s.stopCh:
                    return
                case <-ctx.Done():
@@ -440,29 +472,28 @@ The change has two parts:
            }
        }()
    }
-
-   func (s *Syncer) runOnceTracked(ctx context.Context) {
-       s.wg.Add(1)
-       defer s.wg.Done()
-       s.RunOnce(ctx)
-   }
    ```
 
    `Stop()` is then:
 
    ```go
    func (s *Syncer) Stop() {
-       s.stopOnce.Do(func() { close(s.stopCh) })
-       <-s.done   // wait for the ticker goroutine
+       s.stopOnce.Do(func() {
+           close(s.stopCh)
+           s.lifetimeCancel() // unblock any in-flight TriggerRun
+       })
+       <-s.done    // wait for the ticker goroutine (if Start was called)
        s.wg.Wait() // wait for any in-flight RunOnce, ticker- or handler-driven
    }
    ```
 
-   The two `internal/server/*.go` call sites change from `go s.syncer.RunOnce(...)` to `s.syncer.TriggerRun(...)`. After the change, no caller in the codebase launches a bare `go RunOnce`; the wrapper is the only way to fire-and-forget a run.
+   The two `internal/server/*.go` call sites change from `go s.syncer.RunOnce(...)` to `s.syncer.TriggerRun()`. After the change, no caller in the codebase launches a bare `go RunOnce`; the wrapper is the only way to fire-and-forget a run.
+
+   **Note on `<-s.done` when `Start` was never called:** in test setups that use `TriggerRun` without `Start`, the `done` channel is never closed because no ticker goroutine ever ran. To keep `Stop` valid in that case, `NewSyncer` arranges `done` to be closed if `Start` is never called: a `started atomic.Bool` is flipped by `Start` on entry, and `Stop`'s `stopOnce` block does `if !s.started.Load() { close(s.done) }` before falling through to `<-s.done`. After this, `Stop` is well-defined regardless of whether `Start` was called: it cancels `lifetimeCtx`, marks `done` closed if there is no ticker to wait on, then waits on `wg` for any in-flight `TriggerRun`-launched runs.
 
 The `sync.Once` guard makes `Stop` idempotent so a second call (e.g., test cleanup followed by `Run`'s deferred Stop) does not panic on double-close. `<-s.done` and `s.wg.Wait()` are both safe to call multiple times.
 
-Important consequence for `RunOnce`'s context: closing `stopCh` is not enough on its own to interrupt a long-running HTTP request inside `RunOnce`, which observes only its own `ctx` parameter. The handler-launched runs use `context.WithoutCancel(r.Context())` so they survive the request lifecycle, but that means they ignore the parent ctx entirely. To make these waitable AND cancelable on shutdown, the Syncer also exposes a per-syncer "lifetime context": `Start` records `s.lifetimeCtx, s.lifetimeCancel = context.WithCancel(ctx)`, and `TriggerRun(ctx)` calls `RunOnce(s.lifetimeCtx)` (not the caller's request ctx), so manual runs are bounded by the syncer's own lifetime. `Run` creates a dedicated `syncCtx, cancelSync := context.WithCancel(ctx)` and passes `syncCtx` to `Syncer.Start`. The deferred `cancelSync()` (run before the deferred `Stop()`) cancels both the ticker's ctx AND every in-flight `TriggerRun`-launched run, so `Stop` never blocks indefinitely on a stuck network request — the canceled context unblocks the in-flight HTTP call, the goroutine returns, `wg` reaches zero, and `Stop` proceeds.
+Effective shutdown sequence in `Run`: the deferred `cancelSync()` (which cancels the `syncCtx` passed to `Start`) propagates through the linker goroutine to `lifetimeCancel`, which unblocks any in-flight HTTP call inside both ticker- and handler-driven `RunOnce` invocations. The deferred `Stop()` then closes `stopCh`, waits for the ticker goroutine on `done`, and waits for `wg` to drain. Only then does `defer DB.Close()` run.
 
 ### WriteTimeout
 
@@ -770,9 +801,13 @@ When SSE is connected:
 - Syncer with `onStatusChange`: callback fires for started/progress/complete transitions
 - Syncer with `IsNotModified`: verify PR processing is skipped on 304, CI refresh still runs with cached head SHAs, issue sync still runs on PR list 304
 - `Syncer.Stop()` waits for in-flight `RunOnce`: install a mock client whose list call blocks on a test channel. Call `Start(ctx)`, wait until the mock confirms the goroutine entered the blocked list call, then call `Stop()` from the test goroutine and assert it does NOT return immediately — measure that `Stop()` only returns after the mock channel is released (or after the parent ctx is canceled, which the test does manually to drive the unblock). Without the `done` channel and the `<-s.done` wait, this test would race and `Stop()` would return immediately. Direct unit-level guard for the waitable-shutdown contract.
-- `Syncer.Stop()` waits for handler-triggered `TriggerRun`: same mock-blocking-channel setup, but instead of starting the ticker via `Start`, call `TriggerRun(ctx)` directly (simulating an API handler). Wait until the mock confirms the goroutine entered the blocked list call, then call `Stop()` and assert it blocks until the run completes (or until the ctx-driven unblock fires). Regression guard for the API-triggered shutdown race where `huma_routes.go` and `settings_handlers.go` would otherwise launch syncs that outlive `Stop()`.
+- `Syncer.Stop()` waits for handler-triggered `TriggerRun` **without ever calling `Start`**: same mock-blocking-channel setup, but the test never calls `Start(ctx)`. It calls `NewSyncer(...)` then `TriggerRun()` directly, simulating an API handler firing on a syncer that was just constructed. Wait until the mock confirms the goroutine entered the blocked list call, then call `Stop()` from a separate goroutine. Assert (1) `Stop()` initially blocks (the in-flight `RunOnce` is not done), (2) `Stop()`'s `lifetimeCancel()` actually unblocks the in-flight HTTP call inside `RunOnce` (because the mock observes `lifetimeCtx.Done()`), and (3) `Stop()` returns shortly after. This is the regression guard for the contradiction where `done` would otherwise never close (no ticker goroutine ever ran) and `Stop` would wait forever on `<-s.done`. The fix — `NewSyncer` allocating `lifetimeCtx`/`lifetimeCancel` up front, and the `started atomic.Bool` letting `Stop` short-circuit `done` — is verified by this test.
+- `Syncer.Stop()` waits for handler-triggered `TriggerRun` **after `Start`**: same as above but the test calls `Start(ctx)` first. Verifies that the same `Stop` semantics hold when both ticker- and handler-driven runs are in flight.
 - `Syncer.Stop()` is idempotent: call `Stop()` twice in sequence on a stopped syncer; the second call must return without panicking on a double-close of `stopCh` (verifies the `sync.Once` guard).
-- `cmd/middleman` startup AST guardrail (`main_ast_test.go`): the forbidden-set construction is extended to also forbid bare `go (*github.Syncer).RunOnce` and any direct `go x.RunOnce(...)` outside `Run` or the `TriggerRun` wrapper. Concretely, `RunOnce` is added to the forbidden set's lifecycle method names, with the same pointer-identity check via `types.NewMethodSet(*Syncer)`. The exemption set is extended to permit references inside the `TriggerRun` and `Start` `*types.Func` (looked up by the same `types.NewMethodSet` mechanism). This enforces that no future API handler or test can reintroduce a bare `go syncer.RunOnce(...)` that bypasses the `WaitGroup`.
+- `RunOnce` AST guardrail. The bare-`go RunOnce` regression check lives in **two coordinated AST tests**, because the call sites it must protect span two packages (`internal/server/huma_routes.go`, `internal/server/settings_handlers.go`) and the existing `main_ast_test.go` is scoped to `cmd/middleman`. The two tests share the same forbidden-set construction logic via a small helper, and each scopes its `go/packages` load to the package whose call sites it protects:
+  - Extension to `cmd/middleman/main_ast_test.go`: `RunOnce` is added to the forbidden set built from `types.NewMethodSet(*Syncer)`. The exempted FuncDecls are the package-level `Run` (already covered) AND the `*Syncer.Start` method (so the inlined `wg.Add` / `s.RunOnce(ctx)` / `wg.Done` block inside `Start`'s ticker loop is allowed) AND `*Syncer.TriggerRun` (so the wrapper that handler code calls is allowed). Both Start and TriggerRun are looked up by `*types.Func` pointer identity via `types.NewMethodSet(*Syncer)`, the same mechanism as the forbidden set, so a rename of either method updates both the forbidden set and the exemption set together.
+  - New file `internal/server/server_ast_test.go`: loads the `internal/server` package with `go/packages` and runs the same selector-walking visitor against the same forbidden set. There are no exempted FuncDecls in this package — the only legal call to `Syncer.RunOnce` from anywhere in `internal/server` is `s.syncer.TriggerRun(...)`, which is a different method (`TriggerRun`), not `RunOnce`, so it never appears in the AST as a `RunOnce` selector. Any future bare `go s.syncer.RunOnce(...)` inside `internal/server` fails this test.
+  - The AST test file in `internal/server` shares the forbidden-set construction with `cmd/middleman` via a small unexported helper in a new shared `internal/asttest` package (just enough to look up `*Syncer.RunOnce` via `types.NewMethodSet`), so a rename of `RunOnce` updates both tests in lockstep. This is the **only** code that the AST tests share — the visitor logic and exemption logic stays per-test because the exempted call sites differ between the two packages.
 - Hub slow-consumer disconnect: subscribe with a context that does not cancel, then call `Broadcast` 17 times in a row (one more than the buffer). Assert that the 17th broadcast removes the subscriber from the hub's map AND closes the channel (the test reads from the channel and observes `ok == false` once the buffered events are drained). Then broadcast a `data_changed` event and assert it is NOT delivered to the closed channel — proving the hub does not panic and the closed subscriber stays gone. Regression guard for the silent-drop bug where a slow consumer would lose terminal events forever.
 - SSE handler exits cleanly on hub-side channel close: open a real SSE subscription via `httptest`, then from the test deliberately overrun the buffer to make the hub close the subscriber's channel. Read the response body and assert (a) the handler returns without writing any zero-value `event: \ndata: {}\n\n` frames, (b) the connection closes from the server side (subsequent reads return EOF), and (c) reconnecting yields the cached `lastSyncStatus` as the first frame on the new subscription. End-to-end check that the two-value receive plus hub close path is wired correctly.
 
@@ -806,7 +841,9 @@ When SSE is connected:
 | `frontend/src/lib/stores/events.svelte.ts` | SSE client and connection management |
 | `cmd/middleman/app.go` | `App` struct, `Bootstrap(cfg, configPath, ghClient)` helper that creates syncer + constructs server (primes hub, wires callback) without starting the syncer or binding, and `Run(ctx, cfg, configPath, ghClient, addr)` helper that calls `Bootstrap`, starts the syncer, synchronously binds via `Server.Listen(addr)` (returning any bind error directly), runs `Server.Serve()` in a goroutine, and selects on `ctx.Done()` to invoke `Server.Shutdown` (5s deadline, waiting for the serve goroutine to exit afterward) or on a server-error channel. `Run` is the **only** function in the entire `cmd/middleman` package that may reference `Syncer.Start`, `Server.Listen`, `Server.Serve`, or `Server.Shutdown`; `Bootstrap` is exposed separately so tests can inspect hub state between construction and start but must not call any of those lifecycle methods. |
 | `cmd/middleman/app_test.go` | Startup-ordering integration tests that drive `Bootstrap` directly with a mock GitHub client that blocks mid-`RunOnce`, asserting the cached `lastSyncStatus` reflects the in-progress state for new subscribers. Also contains the `Run` bind-error, serve-error, and shutdown happy-path tests described in the Testing section. |
-| `cmd/middleman/main_ast_test.go` | Type-aware regression test using `go/packages`: loads the entire `cmd/middleman` package with type info. A first pass locates the unique package-level `Run` FuncDecl in `app.go` (`Recv == nil`, `Name == "Run"`, validated signature) — failing if none or more than one exists. A second pass uses `ast.Walk` with a visitor struct carrying `enclosing` **by value** (so child visitors only see a `FuncDecl` as enclosing inside its own subtree — package-scope selectors after a `FuncDecl` correctly see `enclosing == nil`), visits every `*ast.SelectorExpr` in every non-test file **including `app.go`**, resolves each selector via `TypesInfo.Selections[sel]`, and accepts both `types.MethodVal` and `types.MethodExpr` kinds. The forbidden set is a `map[*types.Func]bool` built by looking up the concrete lifecycle methods via `types.NewMethodSet(*Syncer)` / `types.NewMethodSet(*Server)`. The build fails if any selector resolves to a `*types.Func` in the forbidden set inside a `FuncDecl` that is not pointer-identical to the validated `Run` node. Prevents bypass via: a new sibling helper file; a new function added inside `app.go` itself; a same-named method on another receiver; method-expression call syntax; method-value alias assignment; or a package-scope `var x = ...` declared after `Run` (visitor push/pop). Indirection through a locally-declared interface (`var s lifecycleIface = app.Server; s.Serve()`) is a known limitation, documented in the AST guardrail rationale. |
+| `cmd/middleman/main_ast_test.go` | Type-aware regression test using `go/packages`: loads the entire `cmd/middleman` package with type info. A first pass locates the unique package-level `Run` FuncDecl in `app.go` (`Recv == nil`, `Name == "Run"`, validated signature) — failing if none or more than one exists. A second pass uses `ast.Walk` with a visitor struct carrying `enclosing` **by value** (so child visitors only see a `FuncDecl` as enclosing inside its own subtree — package-scope selectors after a `FuncDecl` correctly see `enclosing == nil`), visits every `*ast.SelectorExpr` in every non-test file **including `app.go`**, resolves each selector via `TypesInfo.Selections[sel]`, and accepts both `types.MethodVal` and `types.MethodExpr` kinds. The forbidden set is a `map[*types.Func]bool` built by looking up the concrete lifecycle methods via `types.NewMethodSet(*Syncer)` / `types.NewMethodSet(*Server)`, **including `RunOnce`**. The exemption set is `{Run (FuncDecl pointer identity), *Syncer.Start, *Syncer.TriggerRun}`, all looked up via the same `types.NewMethodSet` mechanism. The build fails if any selector resolves to a `*types.Func` in the forbidden set inside a `FuncDecl` that is not in the exemption set. Prevents bypass via: a new sibling helper file; a new function added inside `app.go` itself; a same-named method on another receiver; method-expression call syntax; method-value alias assignment; or a package-scope `var x = ...` declared after `Run` (visitor push/pop). Indirection through a locally-declared interface (`var s lifecycleIface = app.Server; s.Serve()`) is a known limitation, documented in the AST guardrail rationale. |
+| `internal/server/server_ast_test.go` | Companion AST guardrail loaded with `go/packages` against the `internal/server` package. Uses the same selector-walking visitor and the same forbidden-set construction (sharing the lookup helper from `internal/asttest`), but with an **empty** exemption set: no FuncDecl in `internal/server` is permitted to reference the forbidden methods directly. The only legal way for handler code to fire a sync is `s.syncer.TriggerRun(...)`, which selects `TriggerRun`, not `RunOnce`, so it does not match the forbidden set. Prevents a future bare `go s.syncer.RunOnce(context.WithoutCancel(...))` from being reintroduced in `huma_routes.go`, `settings_handlers.go`, or any other handler in `internal/server`. Without this companion test, the `cmd/middleman`-scoped guard would not see the handler files at all, leaving the actual race-prone call sites unprotected. |
+| `internal/asttest/forbidden.go` | New unexported package containing a single helper function `LifecycleForbiddenSet(syncerPkg, serverPkg *types.Package) map[*types.Func]bool` that builds the canonical forbidden-method set via `types.NewMethodSet(*Syncer)` and `types.NewMethodSet(*Server)`. Both AST tests call this helper so a rename of any forbidden method updates both tests in lockstep. This is the only logic shared between the two AST tests; the visitor and exemption logic stays per-test because the exempted call sites differ between packages. |
 
 ### Modified Files
 | File | Change |
