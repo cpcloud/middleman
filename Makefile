@@ -122,10 +122,10 @@ test-short: ensure-embed-dir
 test-integration: ensure-embed-dir
 	go test -tags integration ./... -v -count=1
 
-# Run full-stack E2E tests (Playwright against real Go server)
+# Run full-stack E2E tests (Playwright against real Go server, excludes roborev)
 test-e2e: frontend
 	go build -o ./cmd/e2e-server/e2e-server ./cmd/e2e-server
-	cd frontend && bun run playwright test --config=playwright-e2e.config.ts
+	cd frontend && bun run playwright test --config=playwright-e2e.config.ts --project=chromium
 
 # Run roborev e2e tests with Docker (ROBOREV_SRC, ROBOREV_REF, ROBOREV_PORT configurable)
 test-e2e-roborev:
