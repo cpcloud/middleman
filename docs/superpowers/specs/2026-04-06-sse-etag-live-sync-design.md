@@ -896,13 +896,39 @@ When SSE is connected:
 - `Syncer.Start()` called twice is a no-op on the second call: call `Start(ctx)` twice in sequence. Assert the second call does not spawn a second ticker goroutine — the mock GitHub client should observe only one `RunOnce` per tick interval, not two. Verifies the same mutex-guarded check.
 - **`Syncer.Stop()` does NOT race past a freshly-spawned ticker goroutine that has not yet reached `wg.Add(1)`**: this is the regression guard for the WaitGroup race where `Start` spawns the goroutine and `Stop` immediately runs `wg.Wait()` with counter zero. **Instrumentation must observe ticker-goroutine entry, not the first mock list invocation**: a correct implementation that bracketed `wg.Add(1)` around the per-cycle `RunOnce` could still satisfy shutdown ordering even if `RunOnce` returned early on canceled context before ever reaching `ListOpenPullRequests` — making "first list call" an unreliable signal that would deadlock the test. Instead, plumb a **buffered** `tickerStartedCh chan struct{}` (or equivalent test-only hook field) through `NewSyncer` for tests; the ticker goroutine sends on that channel as the very first statement after its `defer close(s.done)` and `defer wg.Done()`, **before** the `wg.Add(1)` for the initial run. The hook channel MUST have buffer ≥ 1 so the ticker goroutine's send never blocks (and so the goroutine never deadlocks waiting for a reader before it can reach the wg.Add or the shutdown checks).
 
-   The test shape is **not** synchronous Start-then-Stop in one goroutine — that ordering would let `Stop()` return before the test could observe `tickerStartedCh`, defeating the assertion. Instead:
-   1. Call `Start(ctx)`.
-   2. Spawn a helper goroutine that calls `Stop()` and signals a separate `stopReturnedCh chan struct{}` (also buffered or closed) when `Stop()` returns.
-   3. From the test goroutine, perform an ordering assertion using `select` over `stopReturnedCh` and `tickerStartedCh`: confirm the test can receive from `tickerStartedCh` BEFORE `stopReturnedCh` becomes ready. The simplest way to express this is to read from `tickerStartedCh` first (with a generous timeout) and only then read from `stopReturnedCh` (also with a timeout).
-   4. Assert (1) `tickerStartedCh` was received before `stopReturnedCh` (proving the ticker goroutine actually entered before `Stop()` returned, so `Stop()` did not race past the spawn-but-not-yet-Add window), and (2) no `RunOnce` invocation begins after `stopReturnedCh` fires (track this via a separate `runOnceStartedCh` that the mock's list call writes to, or equivalently a counter incremented at `RunOnce` entry via a test hook).
+   The test shape is **not** synchronous Start-then-Stop in one goroutine — that ordering would let `Stop()` return before the test could observe `tickerStartedCh`, defeating the assertion. **Naïve sequential reads from the two buffered channels also do not verify ordering**: reading `tickerStartedCh` first and `stopReturnedCh` second can pass even when `Stop()` actually returned first, because the ticker goroutine could send to `tickerStartedCh` afterwards and that send would still satisfy the first receive. The buffered hook channel records "the ticker goroutine eventually entered" but does NOT preserve the relative timing against `Stop()`'s return. The test must instead **race the two channels in a single `select`** so the language semantics enforce the ordering check at receive time.
 
-   Run with `-race` enabled to catch concurrent map writes, etc. Without the `wg.Add(2)` reservation under the lifecycle mutex inside `Start`, `Stop` could in principle see counter zero and return before the ticker goroutine was scheduled — the assertion in step 4(1) catches this. The test should be repeated 100+ times in a loop (or with `go test -count=N`) to flush out scheduling races. To maximize the chance of the race firing even with the helper-goroutine shape, the test goroutine should use `runtime.Gosched()` or a single `runtime.LockOSThread` between `Start` and spawning the helper to discourage the scheduler from running the ticker goroutine before the Stop helper is in flight.
+   The recipe is:
+   1. Call `Start(ctx)`.
+   2. Spawn a helper goroutine that calls `Stop()` and, when `Stop()` returns, signals a buffered `stopReturnedCh chan struct{}` (or `close(stopReturnedCh)`).
+   3. From the test goroutine, perform the ordering assertion as a single `select`:
+      ```go
+      select {
+      case <-tickerStartedCh:
+          // Ticker goroutine entered BEFORE Stop returned. This is
+          // the only acceptable outcome — the wg.Add(2) reservation
+          // under the lifecycle mutex inside Start happened-before
+          // Stop's wg.Wait().
+      case <-stopReturnedCh:
+          t.Fatalf("Stop() returned before ticker goroutine entered: " +
+              "wg.Add(2) reservation race not closed")
+      case <-time.After(testTimeout):
+          t.Fatalf("neither tickerStartedCh nor stopReturnedCh fired " +
+              "within %s", testTimeout)
+      }
+      // After the ordering check passes, wait for Stop to actually
+      // return so the test can clean up deterministically.
+      select {
+      case <-stopReturnedCh:
+      case <-time.After(testTimeout):
+          t.Fatalf("Stop() did not return after ticker entered")
+      }
+      ```
+   4. Additionally assert that no `RunOnce` invocation begins after `stopReturnedCh` fires (track this via a separate `runOnceStartedCh` that the mock's list call writes to, or equivalently a counter incremented at `RunOnce` entry via a test hook).
+
+   The single `select` is what makes the ordering check sound: Go's `select` resolves whichever case is ready at the moment of the receive, so if `Stop()` returned first, the helper goroutine's write to `stopReturnedCh` makes that case ready and the test fails. If both channels happen to become ready in the same scheduler quantum, Go's `select` chooses uniformly at random — running the test 100+ times under `-race` (or with `go test -count=N`) catches any scheduling that consistently lets the Stop goroutine win.
+
+   Run with `-race` enabled to catch concurrent map writes, etc. Without the `wg.Add(2)` reservation under the lifecycle mutex inside `Start`, `Stop` could in principle see counter zero and return before the ticker goroutine was scheduled — the `select` in step 3 catches this by failing the test the moment `stopReturnedCh` fires first. The test should be repeated 100+ times in a loop (or with `go test -count=N`) to flush out scheduling races. To maximize the chance of the race firing even with the helper-goroutine shape, the test goroutine should use `runtime.Gosched()` between `Start` and spawning the helper to discourage the scheduler from running the ticker goroutine before the Stop helper is in flight.
 - **`Syncer.TriggerRun()` racing `Stop()` does NOT let a sync escape shutdown**: test creates a Syncer, spawns `TriggerRun()` and `Stop()` concurrently (paired in tight loops with `runtime.Gosched()` between iterations to interleave them). After the join, assert that no `RunOnce` was launched after `Stop` returned: instrument the mock client to record the order of (Stop returned, RunOnce started) events and assert no RunOnce-start follows the Stop-returned timestamp. The lifecycle mutex on TriggerRun's check-and-Add path is what makes this safe — without it, TriggerRun could `wg.Add(1)` after Stop's `wg.Wait()` had returned. Run repeatedly under `-race`.
 - `RunOnce` AST guardrail. The bare-`go RunOnce` regression check lives in **three coordinated AST tests**, because the call sites it must protect span three packages: `cmd/middleman` (where `Run` composes lifecycle calls), `internal/server` (where handlers fire manual syncs at `huma_routes.go:775` and `settings_handlers.go:147`), and `internal/github` itself (where `*Syncer.Start`'s inlined ticker-driven `RunOnce` call and the new `*Syncer.TriggerRun` wrapper live — any future bare `RunOnce` added anywhere else in `internal/github` would bypass a guard scoped only to the other two packages). The three tests share the same forbidden-set construction logic via a small helper, and each scopes its `go/packages` load to the package whose call sites it protects:
   - Extension to `cmd/middleman/main_ast_test.go`: `RunOnce` is added to the forbidden set built from `types.NewMethodSet(*Syncer)`. The only exempted FuncDecl in this package is the already-covered package-level `Run` in `app.go`. `*Syncer.Start` and `*Syncer.TriggerRun` cannot be exempted here because their bodies live in `internal/github`, not in `cmd/middleman`, so they are not visible to the `go/packages` load scoped to this package — their exemptions belong in the `internal/github` companion test instead.
