@@ -149,6 +149,16 @@ func newServer(
 	mux.HandleFunc("POST /api/v1/repos", s.handleAddRepo)
 	mux.HandleFunc("DELETE /api/v1/repos/{owner}/{name}", s.handleDeleteRepo)
 
+	// Roborev proxy
+	if cfg != nil {
+		roborevTarget := cfg.RoborevEndpoint()
+		mux.Handle("/api/roborev/", roborevProxy(roborevTarget))
+		mux.HandleFunc(
+			"GET /api/v1/roborev/status",
+			handleRoborevStatus(cfg),
+		)
+	}
+
 	if frontend != nil {
 		indexBytes, err := fs.ReadFile(frontend, "index.html")
 		if err != nil {
