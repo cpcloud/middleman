@@ -1,19 +1,15 @@
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
 import type { Page } from "@playwright/test";
 import { expect } from "@playwright/test";
 
-const thisDir = path.dirname(
-  fileURLToPath(import.meta.url),
-);
-
 function readEnvFile(): Record<string, string> {
-  const envPath = path.resolve(
-    thisDir,
-    "../../../../tests/integration/.env",
-  );
+  const envPath = process.env["ROBOREV_ENV_FILE"];
+  if (!envPath) {
+    throw new Error(
+      "ROBOREV_ENV_FILE not set — run via scripts/run-roborev-e2e.sh",
+    );
+  }
   const content = readFileSync(envPath, "utf-8");
   const env: Record<string, string> = {};
   for (const line of content.split("\n")) {

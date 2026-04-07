@@ -17,6 +17,7 @@
   import StatusBar from "./lib/components/layout/StatusBar.svelte";
   import SettingsPage from "./lib/components/settings/SettingsPage.svelte";
   import FlashBanner from "./lib/components/FlashBanner.svelte";
+  import { showFlash } from "./lib/stores/flash.svelte.js";
   import { initItemRefHandler } from "./lib/utils/itemRefHandler.js";
   import {
     initTheme,
@@ -371,6 +372,7 @@
 <Provider
   {client}
   roborevBaseUrl="/api/roborev"
+  onError={showFlash}
   onNavigate={(e) =>
     navigate(typeof e === "string" ? e : e.path)}
   actions={{

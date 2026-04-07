@@ -19,7 +19,6 @@
   import {
     createLogStore,
   } from "./stores/roborev/log.svelte.js";
-  import { showFlash } from "./stores/flash.svelte.js";
   import type {
     MiddlemanClient, ActionRegistry, NavigateCallback,
     EventCallback, PrepareRouteCallback, HostStateAccessors,
@@ -76,6 +75,7 @@
     sidebar?: SidebarAccessors;
     getPage?: () => string;
     roborevBaseUrl?: string;
+    onError?: (msg: string) => void;
     stores?: StoreInstances | undefined;
     children?: import("svelte").Snippet;
   }
@@ -95,6 +95,7 @@
     },
     getPage = () => "",
     roborevBaseUrl = undefined,
+    onError = undefined,
     stores = $bindable(),
     children,
   }: Props = $props();
@@ -113,6 +114,7 @@
     sb: SidebarAccessors,
     gp: () => string,
     roborevBase: string | undefined,
+    errorCb: ((msg: string) => void) | undefined,
   ): StoreInstances {
     const grouping = createGroupingStore();
     const settingsStore = createSettingsStore();
@@ -191,17 +193,19 @@
         bp + roborevBase,
       );
 
-      const jobsStore = createJobsStore({
+      const jobsOpts: Parameters<typeof createJobsStore>[0] = {
         client: roborevClient,
         navigate: nav,
-        onError: showFlash,
-      });
+      };
+      if (errorCb) jobsOpts.onError = errorCb;
+      const jobsStore = createJobsStore(jobsOpts);
       si.roborevJobs = jobsStore;
 
-      const reviewStore = createReviewStore({
+      const reviewOpts: Parameters<typeof createReviewStore>[0] = {
         client: roborevClient,
-        onError: showFlash,
-      });
+      };
+      if (errorCb) reviewOpts.onError = errorCb;
+      const reviewStore = createReviewStore(reviewOpts);
       si.roborevReview = reviewStore;
 
       const logStore = createLogStore({
@@ -245,7 +249,7 @@
   stores = init(
     client, hostState, config, actions,
     onNavigate, onEvent, prepareRoute,
-    sidebar, getPage, roborevBaseUrl,
+    sidebar, getPage, roborevBaseUrl, onError,
   );
 
   onDestroy(() => {
