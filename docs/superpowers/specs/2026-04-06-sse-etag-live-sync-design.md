@@ -628,19 +628,21 @@ const etagTTL = 30 * time.Minute
 ```
 
 `RoundTrip(req)`:
-1. Check if this is a paginated later-page request: if the URL has a `page` query parameter with value > 1, skip ETag handling entirely — pass through to the base transport and return.
-2. Look up `req.URL.String()` in cache. If found AND not expired (`time.Since(entry.cachedAt) < etagTTL`), clone the request and add `If-None-Match: <etag>` header (must clone to avoid mutating the original). If expired, delete the entry and proceed as uncached.
-3. Call `base.RoundTrip(req)` with the (possibly modified) request.
-4. On 200: if the response has an `ETag` header AND does NOT have a `Link` header containing `rel="next"` (indicating this is a single-page result), store the ETag in cache with `cachedAt: time.Now()`. If the response IS multi-page (has `Link: next`), delete any previously-cached ETag for this URL (`cache.Delete(url)`) — this evicts stale entries from when the endpoint was single-page and ensures multi-page endpoints always fetch fresh on the next cycle.
-5. On 304: return response as-is (empty body, 304 status). Do NOT update `cachedAt` — the entry must age out so the TTL can eventually force an unconditional fetch.
-6. On other status: return response as-is.
+1. **Gate check:** if `req.Method` is not `GET`, or the request URL path does not match the ETag-eligible endpoint allowlist, pass through to the base transport and return. The allowlist matches the two target endpoints by path suffix pattern: `/repos/{owner}/{name}/pulls` and `/repos/{owner}/{name}/issues`. This prevents ETags from leaking onto excluded read endpoints (`GetCombinedStatus`, `ListCheckRunsForRef`) which cannot handle 304s correctly, and onto mutating requests (`POST`, `PATCH`, `PUT`, `DELETE`) that may share URL paths with read endpoints.
+2. Check if this is a paginated later-page request: if the URL has a `page` query parameter with value > 1, skip ETag handling entirely — pass through to the base transport and return.
+3. Look up `req.URL.String()` in cache. If found AND not expired (`time.Since(entry.cachedAt) < etagTTL`), clone the request and add `If-None-Match: <etag>` header (must clone to avoid mutating the original). If expired, delete the entry and proceed as uncached.
+4. Call `base.RoundTrip(req)` with the (possibly modified) request.
+5. On 200: if the response has an `ETag` header AND does NOT have a `Link` header containing `rel="next"` (indicating this is a single-page result), store the ETag in cache with `cachedAt: time.Now()`. If the response IS multi-page (has `Link: next`), delete any previously-cached ETag for this URL (`cache.Delete(url)`) — this evicts stale entries from when the endpoint was single-page and ensures multi-page endpoints always fetch fresh on the next cycle.
+6. On 304: return response as-is (empty body, 304 status). Do NOT update `cachedAt` — the entry must age out so the TTL can eventually force an unconditional fetch.
+7. On other status: return response as-is.
 
-**Three pagination safeguards:**
-- Step 1 (page parameter check) prevents later pages from caching or using stale ETags. go-github's first page request has no `page` parameter, while subsequent pages have `page=2`, `page=3`, etc.
-- Step 4 (Link: next eviction) prevents the first page of multi-page results from being cached, AND actively evicts any previously-cached ETag for that URL. This handles the single-page → multi-page transition: if a repo was single-page (ETag cached), then grows past 100 items, the first 200 response with `Link: next` evicts the stale entry.
-- Step 2 (TTL expiry) bounds staleness for the reverse edge case: a cached single-page ETag that 304s indefinitely, hiding a transition to multi-page. `ListOpenPullRequests` uses GitHub's default `created desc` sort, so page 1 content can remain unchanged even when later-page items are modified. The 30-minute TTL forces periodic unconditional fetches, bounding the window during which such changes are invisible.
+**Four safeguards:**
+- Step 1 (gate check) restricts ETag handling to GET requests on the two explicitly targeted endpoints. All other endpoints — `GetCombinedStatus`, `ListCheckRunsForRef`, mutating requests — pass through the transport unmodified. This is the primary scope control.
+- Step 2 (page parameter check) prevents later pages from caching or using stale ETags. go-github's first page request has no `page` parameter, while subsequent pages have `page=2`, `page=3`, etc.
+- Step 5 (Link: next eviction) prevents the first page of multi-page results from being cached, AND actively evicts any previously-cached ETag for that URL. This handles the single-page → multi-page transition: if a repo was single-page (ETag cached), then grows past 100 items, the first 200 response with `Link: next` evicts the stale entry.
+- Step 3 (TTL expiry) bounds staleness for the reverse edge case: a cached single-page ETag that 304s indefinitely, hiding a transition to multi-page. `ListOpenPullRequests` uses GitHub's default `created desc` sort, so page 1 content can remain unchanged even when later-page items are modified. The 30-minute TTL forces periodic unconditional fetches, bounding the window during which such changes are invisible.
 
-All three are self-contained in the transport. No syncer, client, or collectPages changes are needed.
+All four are self-contained in the transport. No syncer, client, or collectPages changes are needed.
 
 ### Not-Modified Detection
 
@@ -833,14 +835,16 @@ App unmount    -> disconnect() (close EventSource)
 
 `connect()` is called from `App.svelte`'s `onMount`. `disconnect()` is called from `onDestroy`.
 
-**No event replay:** The SSE endpoint does not use event IDs or maintain a replay buffer. Events emitted during a brief SSE disconnection are lost. This is acceptable because: (a) polling re-enables immediately on disconnect and catches up within seconds, and (b) the `open` handler fires a full refresh on every (re)connect, so the client catches up with any `data_changed` events missed during the disconnection window without waiting for the next sync cycle.
+**No event replay:** The SSE endpoint does not use event IDs or maintain a replay buffer. Events emitted during a brief SSE disconnection are lost. This is acceptable because: (a) polling re-enables immediately on disconnect and catches up within seconds for views whose polling timers are active (pull list, issue list, activity, detail — when their components are mounted), and (b) the `open` handler fires a full refresh on every (re)connect, so the client catches up with any `data_changed` events missed during the disconnection window without waiting for the next sync cycle. **Limitation:** status-bar counts (pull/issue totals, repo count) can go stale during an SSE outage if the user is on `activity` or `settings`, because `loadPulls()`/`loadIssues()` are only polled when their list/board components are mounted. This is acceptable — the counts are layout chrome, the outage is local and brief, and the `open` handler's full refresh corrects them on reconnect. Adding a global background poller for two badge numbers would add complexity for negligible benefit.
 
 ### Fallback Behavior
 
 When SSE is disconnected (fallback):
 - Sync status polling: 2s while syncing, 30s idle (current behavior, unchanged)
-- Activity polling: 15s (current behavior, unchanged)
-- Detail polling: 60s (current behavior, unchanged)
+- Pull/issue list polling: 15s (only when list/board components are mounted)
+- Activity polling: 15s (only when activity view is mounted)
+- Detail polling: 60s (only when detail panel is open)
+- Status-bar counts: not independently polled — updated on next reconnect or navigation to a list view
 
 When SSE is connected:
 - All polling timers disabled
