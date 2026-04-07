@@ -10,6 +10,7 @@ type ReviewResponse = components["schemas"]["Response"];
 
 export interface ReviewStoreOptions {
   client: RoborevClient;
+  onError?: (msg: string) => void;
 }
 
 export function createReviewStore(
@@ -80,7 +81,10 @@ export function createReviewStore(
       "/api/review/close",
       { body: { job_id: jobId, closed } },
     );
-    if (error) return;
+    if (error) {
+      opts.onError?.("Failed to close review");
+      return;
+    }
     if (review) {
       review = { ...review, closed };
     }
@@ -100,7 +104,10 @@ export function createReviewStore(
         },
       },
     );
-    if (error || !data) return false;
+    if (error || !data) {
+      opts.onError?.("Failed to add comment");
+      return false;
+    }
     responses = [...responses, data];
     return true;
   }

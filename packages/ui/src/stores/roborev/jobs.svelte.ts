@@ -11,6 +11,7 @@ type JobStats = components["schemas"]["JobStats"];
 export interface JobsStoreOptions {
   client: RoborevClient;
   navigate: (path: string) => void;
+  onError?: (msg: string) => void;
 }
 
 type SortColumn =
@@ -214,7 +215,10 @@ export function createJobsStore(opts: JobsStoreOptions) {
       "/api/job/cancel",
       { body: { job_id: id } },
     );
-    if (error) return;
+    if (error) {
+      opts.onError?.("Failed to cancel job");
+      return;
+    }
     jobs = jobs.map((j) =>
       j.id === id ? { ...j, status: "canceled" } : j,
     );
@@ -226,7 +230,10 @@ export function createJobsStore(opts: JobsStoreOptions) {
       "/api/job/rerun",
       { body: { job_id: id } },
     );
-    if (error) return;
+    if (error) {
+      opts.onError?.("Failed to rerun job");
+      return;
+    }
     void loadJobs();
   }
 

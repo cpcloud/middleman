@@ -15,11 +15,15 @@
 
   const stores = getStores();
 
+  // Prefer the job from the loaded table page; fall back to
+  // the review store's nested job object for deep links and
+  // off-page selections where the job isn't in the current
+  // 50-row page.
   const selectedJob = $derived(
     stores.roborevJobs?.getJobs().find(
       (j) =>
         j.id === stores.roborevJobs?.getSelectedJobId(),
-    ),
+    ) ?? stores.roborevReview?.getReview()?.job,
   );
 
   const isOpen = $derived(

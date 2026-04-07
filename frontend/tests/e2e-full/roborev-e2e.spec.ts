@@ -1074,12 +1074,18 @@ test.describe.serial("Roborev", () => {
       ).toBeVisible({ timeout: 15_000 });
       await waitForJobRows(page, 1);
 
-      // Now click a row to open the drawer — verify the
-      // full UI chain works after recovery
+      // Click a row to open the drawer and verify content
+      // actually loaded (not just an empty shell)
       await page.locator(".job-row").first().click();
       await expect(
         page.locator(".drawer"),
       ).toBeVisible({ timeout: 10_000 });
+      await expect(
+        page.locator(".job-id"),
+      ).toBeVisible({ timeout: 5_000 });
+      await expect(
+        page.locator(".drawer-header"),
+      ).toContainText(/\d+/);
     });
   });
 });

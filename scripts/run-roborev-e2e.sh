@@ -15,13 +15,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ROBOREV_REF="${ROBOREV_REF:-main}"
 ROBOREV_PORT="${ROBOREV_PORT:-17373}"
-DB_PATH="/tmp/roborev-e2e.db"
-ENV_FILE="$REPO_ROOT/tests/integration/.env"
+DB_PATH="$(mktemp /tmp/roborev-e2e-XXXXXX.db)"
+ENV_FILE="$(mktemp /tmp/roborev-env-XXXXXX)"
 
 cleanup() {
   echo "--- cleanup ---"
-  cd "$REPO_ROOT/tests/integration" && docker compose down -v 2>/dev/null || true
-  rm -f "$ENV_FILE"
+  cd "$REPO_ROOT/tests/integration" && \
+    docker compose --env-file "$ENV_FILE" down -v 2>/dev/null || true
+  rm -f "$DB_PATH" "${DB_PATH}-wal" "${DB_PATH}-shm" "$ENV_FILE"
 }
 trap cleanup EXIT
 
@@ -42,15 +43,21 @@ echo "--- seed database ---"
 cd "$REPO_ROOT"
 go run ./internal/testutil/cmd/seed-roborev -out "$DB_PATH"
 
-# 3. Write .env for docker compose and Playwright helpers
+# 3. Write env file for docker compose and Playwright helpers.
+# Uses a temp file passed via --env-file to avoid clobbering
+# any existing tests/integration/.env.
 printf 'ROBOREV_SRC=%s\nROBOREV_REF=%s\nROBOREV_DB_PATH=%s\nCOMPOSE_DIR=%s\nROBOREV_PORT=%s\n' \
   "$ROBOREV_SRC" "$ROBOREV_REF" "$DB_PATH" \
   "$REPO_ROOT/tests/integration" "$ROBOREV_PORT" \
   > "$ENV_FILE"
 
+# Symlink so Playwright helpers can find it at the expected path.
+ln -sf "$ENV_FILE" "$REPO_ROOT/tests/integration/.env"
+
 # 4. Start roborev daemon in Docker
 echo "--- start daemon (ref=$ROBOREV_REF, port=$ROBOREV_PORT) ---"
-cd "$REPO_ROOT/tests/integration" && docker compose up -d --build --wait
+cd "$REPO_ROOT/tests/integration" && \
+  docker compose --env-file "$ENV_FILE" up -d --build --wait
 
 # 5. Install Playwright browsers if needed
 echo "--- install playwright ---"

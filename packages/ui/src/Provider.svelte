@@ -19,6 +19,7 @@
   import {
     createLogStore,
   } from "./stores/roborev/log.svelte.js";
+  import { showFlash } from "./stores/flash.svelte.js";
   import type {
     MiddlemanClient, ActionRegistry, NavigateCallback,
     EventCallback, PrepareRouteCallback, HostStateAccessors,
@@ -193,11 +194,13 @@
       const jobsStore = createJobsStore({
         client: roborevClient,
         navigate: nav,
+        onError: showFlash,
       });
       si.roborevJobs = jobsStore;
 
       const reviewStore = createReviewStore({
         client: roborevClient,
+        onError: showFlash,
       });
       si.roborevReview = reviewStore;
 
