@@ -1789,6 +1789,10 @@ func TestSSE_ExitsCleanlyOnHubClose(t *testing.T) {
 
 func TestSSE_MarshalFailureContinuesServing(t *testing.T) {
 	s := New(openTestDB(t), nil, nil, nil, "/")
+	// Prime hub so first subscribe gets a sync_status — we read it
+	// as proof the handler has subscribed before we broadcast test events.
+	s.hub.Broadcast(Event{Type: "sync_status", Data: map[string]bool{"running": false}})
+
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 
@@ -1796,23 +1800,45 @@ func TestSSE_MarshalFailureContinuesServing(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	// Broadcast an unmarshalable event (channels cannot be marshaled)
-	s.hub.Broadcast(Event{Type: "bad", Data: make(chan int)})
-	// Followed by a valid event
-	s.hub.Broadcast(Event{Type: "data_changed", Data: struct{}{}})
-
+	// Read the initial cached sync_status to confirm subscription is live
 	scanner := bufio.NewScanner(resp.Body)
-	var eventType string
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "event: ") {
-			eventType = strings.TrimPrefix(line, "event: ")
-		}
-		if line == "" && eventType != "" {
-			break
+	readEvent := func(timeout time.Duration) (string, bool) {
+		done := make(chan struct{})
+		var evType string
+		var found bool
+		go func() {
+			defer close(done)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if strings.HasPrefix(line, "event: ") {
+					evType = strings.TrimPrefix(line, "event: ")
+				}
+				if line == "" && evType != "" {
+					found = true
+					return
+				}
+			}
+		}()
+		select {
+		case <-done:
+			return evType, found
+		case <-time.After(timeout):
+			return "", false
 		}
 	}
-	assert.Equal(t, "data_changed", eventType, "valid event should arrive after marshal failure")
+
+	evType, ok := readEvent(5 * time.Second)
+	require.True(t, ok, "should receive initial sync_status")
+	assert.Equal(t, "sync_status", evType)
+
+	// Now safe to broadcast — handler is subscribed
+	s.hub.Broadcast(Event{Type: "bad", Data: make(chan int)})
+	s.hub.Broadcast(Event{Type: "data_changed", Data: struct{}{}})
+
+	evType, ok = readEvent(5 * time.Second)
+	require.True(t, ok, "should receive valid event after marshal failure")
+	assert.Equal(t, "data_changed", evType, "valid event should arrive after marshal failure")
+	require.NoError(t, scanner.Err())
 }
 
 func TestSSE_SlowConsumerDisconnect(t *testing.T) {
